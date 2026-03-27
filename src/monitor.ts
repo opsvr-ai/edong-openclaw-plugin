@@ -18,6 +18,7 @@
 
 import * as os from "os";
 import * as path from "path";
+import { randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
@@ -169,7 +170,7 @@ function buildMessageContext(
   text: string,
   mediaList: Array<{ path: string; contentType?: string }>,
   quoteContent?: string,
-  opts?: { httpCallbackQueryNonce?: string },
+  opts?: { httpCallbackQueryNonce?: string; httpInvocationId?: string },
 ) {
   const core = getWeComRuntime();
   const body = frame.body as MessageBody;
@@ -202,14 +203,19 @@ function buildMessageContext(
 
   // OpenClaw 入站去重键包含 MessageSid（见 inbound-dedupe.ts：provider|account|session|peer|thread|MessageSid）。
   // 仅用 msgid 时，企微侧可能对多条用户消息复用同一 msgid，或与其他字段组合后与上一条碰撞，导致第二条被静默去重（deliver 永不执行）。
-  // URL 回调每次 POST 的 query.nonce 在约 2h 内唯一（官方要求），与 msgid 组合可稳定区分每次 HTTP 入站。
+  // URL 回调 query.nonce 与 msgid 可区分不同 POST；但 dedupe 在 dispatch 入口即登记 key，若长耗时（工具/技能）导致首条失败或企微重试同一 nonce，
+  // 第二条会被误判为重复而整段跳过。故 HTTP 模式下为每次 processWeComMessage 生成独立 invocation id 并入 MessageSid，避免「首条占坑、重试无 deliver」。
   const createTime = typeof body.create_time === "number" ? body.create_time : undefined;
   const queryNonce = opts?.httpCallbackQueryNonce?.trim();
-  const messageSidForDedupe = queryNonce
-    ? `${body.msgid}:${queryNonce}`
-    : createTime !== undefined
-      ? `${body.msgid}:${createTime}`
-      : body.msgid;
+  const inv = opts?.httpInvocationId?.trim();
+  const messageSidForDedupe =
+    inv != null && inv.length > 0
+      ? `${body.msgid}:${queryNonce ?? "n"}:${inv}`
+      : queryNonce
+        ? `${body.msgid}:${queryNonce}`
+        : createTime !== undefined
+          ? `${body.msgid}:${createTime}`
+          : body.msgid;
 
   // 构建标准消息上下文
   return core.channel.reply.finalizeInboundContext({
@@ -218,6 +224,7 @@ function buildMessageContext(
     CommandBody: messageBody,
 
     MessageSid: messageSidForDedupe,
+    MessageSidFull: body.msgid,
 
     From: chatType === "group" ? `${CHANNEL_ID}:group:${chatId}` : `${CHANNEL_ID}:${body.from.userid}`,
     To: `${CHANNEL_ID}:${chatId}`,
@@ -543,7 +550,7 @@ async function routeAndDispatchMessage(params: {
 
     if (!state.deliverCalled) {
       runtime.error?.(
-        `[wecom][warn] dispatch finished but deliver never ran — inbound may have been deduped/skipped by OpenClaw, or agent produced no blocks. msgid=${(frame.body as MessageBody).msgid}`,
+        `[wecom][warn] dispatch finished but deliver never ran — OpenClaw deduped/skipped this inbound, or the agent produced no deliverable blocks (e.g. empty final after tools). msgid=${(frame.body as MessageBody).msgid}`,
       );
     }
 
@@ -597,6 +604,8 @@ export async function processWeComMessage(params: {
   httpCallbackQueryNonce?: string;
 }): Promise<void> {
   const { frame, account, config, runtime, wsClient, passiveHttpReply, httpCallbackQueryNonce } = params;
+  /** 仅 HTTP 回调：每条处理独立 id，避免 OpenClaw 入站去重在长耗时/失败后把重试误判为重复 */
+  const httpInvocationId = wsClient ? undefined : randomUUID();
   const transport = wsClient
     ? createWebsocketReplyTransport(wsClient)
     : passiveHttpReply
@@ -612,7 +621,7 @@ export async function processWeComMessage(params: {
   const { textParts, imageUrls, imageAesKeys, fileUrls, fileAesKeys, quoteContent } = parseMessageContent(body);
   let text = textParts.join("\n").trim();
   runtime.log?.(
-    `[wecom][trace] inbound: msgid=${body.msgid}, msgtype=${body.msgtype}, chattype=${body.chattype}, chatId=${chatId}, hasResponseUrl=${Boolean(resolveResponseUrl(frame))}, passiveHttp=${Boolean(passiveHttpReply)}`,
+    `[wecom][trace] inbound: msgid=${body.msgid}, msgtype=${body.msgtype}, chattype=${body.chattype}, chatId=${chatId}, hasResponseUrl=${Boolean(resolveResponseUrl(frame))}, passiveHttp=${Boolean(passiveHttpReply)}, httpInv=${httpInvocationId ?? "n/a"}`,
   );
 
   // // 群聊中移除 @机器人 的提及标记
@@ -713,6 +722,7 @@ export async function processWeComMessage(params: {
     httpCallbackQueryNonce: wsClient
       ? undefined
       : (httpCallbackQueryNonce ?? passiveHttpReply?.nonce),
+    httpInvocationId,
   });
   // runtime.log?.(`[plugin -> openclaw] body=${text}, mediaPaths=${JSON.stringify(mediaList.map(m => m.path))}${quoteContent ? `, quote=${quoteContent}` : ''}`);
 
