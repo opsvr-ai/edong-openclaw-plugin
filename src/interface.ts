@@ -34,6 +34,8 @@ export interface MessageState {
   accumulatedText: string;
   /** 流式回复的 streamId，用于保持同一个流式回复使用相同的 streamId */
   streamId?: string;
+  /** 流式通道是否至少成功发送过一次（thinking 或中间帧） */
+  streamStarted?: boolean;
   // /** 是否有用户可见的文本内容（不包括 <think>...</think> 标签） */
   // hasText?: boolean;
   /** 是否已成功发送过媒体文件 */

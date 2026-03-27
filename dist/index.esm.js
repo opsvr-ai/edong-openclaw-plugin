@@ -1977,6 +1977,9 @@ async function sendThinkingReply(params) {
             finish: false,
             runtime,
         });
+        if (state) {
+            state.streamStarted = true;
+        }
     }
     catch (err) {
         if (err instanceof StreamExpiredError && state) {
@@ -2067,10 +2070,17 @@ async function finishThinkingStream(ctx) {
             finishText = "📎 文件已发送，请查收。";
         }
     }
-    // if (!finishText) {
-    //   finishText = "✅ 处理完成。";
-    // }
+    if (!finishText) {
+        // 兜底：当 OpenClaw 未产生可投递块（例如被去重/工具流程未产出 final 文本）时，
+        // 仍需关闭 thinking 并给用户可见反馈，避免表现为“机器人无响应”。
+        finishText = "⚠️ 本次未生成可发送内容，请重试一次，或换一种问法。";
+    }
     if (finishText) {
+        if (!state.streamStarted) {
+            runtime.log?.(`[wecom] stream not started, sending final text via markdown fallback`);
+            await transport.sendMarkdownFallback({ frame, chatId, text: finishText, runtime });
+            return;
+        }
         // 尝试流式发送；若已知过期或发送时发现过期，统一降级为主动发送
         let expired = state.streamExpired;
         if (!expired) {
@@ -2181,6 +2191,7 @@ async function routeAndDispatchMessage(params) {
                                 finish: false,
                                 runtime,
                             });
+                            state.streamStarted = true;
                         }
                         catch (err) {
                             if (err instanceof StreamExpiredError) {
