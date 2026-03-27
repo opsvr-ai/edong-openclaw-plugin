@@ -15,6 +15,7 @@
  * - state-manager.ts   : 全局状态管理（带 TTL 清理）
  * - timeout.ts         : 超时工具
  */
+import type { ServerResponse } from "node:http";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { WSClient } from "@wecom/aibot-node-sdk";
@@ -46,6 +47,15 @@ export declare function processWeComMessage(params: {
     runtime: RuntimeEnv;
     /** URL 回调模式下为 null */
     wsClient: WSClient | null;
+    /**
+     * 无 response_url 时：在同一次企微 POST 回调的 HTTP 响应中返回加密被动回复（path/101033），不能与先发空包再异步回复混用。
+     */
+    passiveHttpReply?: {
+        res: ServerResponse;
+        token: string;
+        encodingAesKey: string;
+        nonce: string;
+    };
 }): Promise<void>;
 /**
  * 监听企业微信 WebSocket 连接

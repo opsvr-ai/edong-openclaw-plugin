@@ -18,6 +18,7 @@
 
 import * as os from "os";
 import * as path from "path";
+import type { ServerResponse } from "node:http";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { WSClient, generateReqId, WSAuthFailureError, WSReconnectExhaustedError } from "@wecom/aibot-node-sdk";
@@ -40,7 +41,12 @@ import {
 import type { WeComMonitorOptions, MessageState } from "./interface.js";
 import { parseMessageContent, type MessageBody } from "./message-parser.js";
 import { StreamExpiredError } from "./message-sender.js";
-import { createWebsocketReplyTransport, createHttpCallbackReplyTransport } from "./wecom-transport.js";
+import {
+  createWebsocketReplyTransport,
+  createHttpCallbackReplyTransport,
+  createPassiveHttpEncryptedReplyTransport,
+  resolveResponseUrl,
+} from "./wecom-transport.js";
 import type { WecomReplyTransport } from "./wecom-transport.js";
 import { downloadAndSaveImages, downloadAndSaveFiles } from "./media-handler.js";
 import { uploadAndSendMedia } from "./media-uploader.js";
@@ -560,11 +566,22 @@ export async function processWeComMessage(params: {
   runtime: RuntimeEnv;
   /** URL 回调模式下为 null */
   wsClient: WSClient | null;
+  /**
+   * 无 response_url 时：在同一次企微 POST 回调的 HTTP 响应中返回加密被动回复（path/101033），不能与先发空包再异步回复混用。
+   */
+  passiveHttpReply?: {
+    res: ServerResponse;
+    token: string;
+    encodingAesKey: string;
+    nonce: string;
+  };
 }): Promise<void> {
-  const { frame, account, config, runtime, wsClient } = params;
+  const { frame, account, config, runtime, wsClient, passiveHttpReply } = params;
   const transport = wsClient
     ? createWebsocketReplyTransport(wsClient)
-    : createHttpCallbackReplyTransport();
+    : passiveHttpReply
+      ? createPassiveHttpEncryptedReplyTransport(passiveHttpReply)
+      : createHttpCallbackReplyTransport();
   const body = frame.body as MessageBody;
   const chatId = body.chatid || body.from.userid;
   const chatType = body.chattype === "group" ? "group" : "direct";
@@ -575,7 +592,7 @@ export async function processWeComMessage(params: {
   const { textParts, imageUrls, imageAesKeys, fileUrls, fileAesKeys, quoteContent } = parseMessageContent(body);
   let text = textParts.join("\n").trim();
   runtime.log?.(
-    `[wecom][trace] inbound: msgid=${body.msgid}, msgtype=${body.msgtype}, chattype=${body.chattype}, chatId=${chatId}, hasResponseUrl=${Boolean(body.response_url)}`,
+    `[wecom][trace] inbound: msgid=${body.msgid}, msgtype=${body.msgtype}, chattype=${body.chattype}, chatId=${chatId}, hasResponseUrl=${Boolean(resolveResponseUrl(frame))}, passiveHttp=${Boolean(passiveHttpReply)}`,
   );
 
   // // 群聊中移除 @机器人 的提及标记

@@ -9,9 +9,9 @@ var node_url = require('node:url');
 var os$1 = require('os');
 var path$1 = require('path');
 var aibotNodeSdk = require('@wecom/aibot-node-sdk');
+var crypto = require('node:crypto');
 var fileType = require('file-type');
 var node_fs = require('node:fs');
-var crypto = require('node:crypto');
 
 var _documentCurrentScript = typeof document !== 'undefined' ? document.currentScript : null;
 function _interopNamespaceDefault(e) {
@@ -757,6 +757,114 @@ async function sendWeComMarkdownHttp(params) {
 }
 
 /**
+ * 企业微信智能机器人「接收消息 URL」模式下的 JSON 加解密（与官方 wxbizmsgcrypt 算法一致）。
+ * receiveid 在企业自建智能机器人场景下传空字符串。
+ *
+ * @see https://developer.work.weixin.qq.com/document/path/101033
+ */
+function sha1Hex(data) {
+    return crypto__namespace.createHash("sha1").update(data, "utf8").digest("hex");
+}
+function sortAndJoin(parts) {
+    return [...parts].sort().join("");
+}
+/**
+ * 校验 msg_signature 是否与 token、timestamp、nonce、encrypt 一致
+ */
+function verifyMsgSignature(token, timestamp, nonce, encrypt, msgSignature) {
+    const expect = sha1Hex(sortAndJoin([token, timestamp, nonce, encrypt]));
+    return expect === msgSignature;
+}
+function pkcs7Unpad(buf) {
+    const pad = buf[buf.length - 1];
+    if (pad < 1 || pad > 32)
+        return buf;
+    return buf.subarray(0, buf.length - pad);
+}
+function pkcs7Pad(buf) {
+    const block = 32;
+    const pad = block - (buf.length % block);
+    const out = Buffer.alloc(buf.length + pad);
+    buf.copy(out);
+    out.fill(pad, buf.length);
+    return out;
+}
+function decodeAesKey(encodingAesKey) {
+    const key = Buffer.from(encodingAesKey, "base64");
+    if (key.length !== 32) {
+        throw new Error(`Invalid EncodingAESKey: expected 32 bytes after base64 decode, got ${key.length}`);
+    }
+    return key;
+}
+/**
+ * 解密 encrypt 字段（Base64 密文）得到 UTF-8 明文字符串（通常为 JSON）
+ */
+function decryptEncryptField(encodingAesKey, encryptB64, receiveId = "") {
+    const aesKey = decodeAesKey(encodingAesKey);
+    const iv = aesKey.subarray(0, 16);
+    const cipher = Buffer.from(encryptB64, "base64");
+    const decipher = crypto__namespace.createDecipheriv("aes-256-cbc", aesKey, iv);
+    decipher.setAutoPadding(false);
+    const decrypted = Buffer.concat([decipher.update(cipher), decipher.final()]);
+    const unpadded = pkcs7Unpad(decrypted);
+    if (unpadded.length < 20) {
+        throw new Error("Decrypted payload too short");
+    }
+    const content = unpadded.subarray(16);
+    const msgLen = content.readUInt32BE(0);
+    const msg = content.subarray(4, 4 + msgLen).toString("utf8");
+    const tail = content.subarray(4 + msgLen).toString("utf8");
+    if (receiveId !== "" && tail !== receiveId) {
+        throw new Error("receiveId mismatch after decrypt");
+    }
+    return msg;
+}
+/**
+ * 加密明文（通常为 JSON 字符串），得到 Base64 密文，用于被动回复包中的 encrypt 字段
+ */
+function encryptToEncryptField(encodingAesKey, plainText, receiveId = "") {
+    const aesKey = decodeAesKey(encodingAesKey);
+    const iv = aesKey.subarray(0, 16);
+    const msgBuf = Buffer.from(plainText, "utf8");
+    const rand = crypto__namespace.randomBytes(16);
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(msgBuf.length, 0);
+    const tail = Buffer.from(receiveId, "utf8");
+    const packed = Buffer.concat([rand, lenBuf, msgBuf, tail]);
+    const padded = pkcs7Pad(packed);
+    const cipher = crypto__namespace.createCipheriv("aes-256-cbc", aesKey, iv);
+    cipher.setAutoPadding(false);
+    const encrypted = Buffer.concat([cipher.update(padded), cipher.final()]);
+    return encrypted.toString("base64");
+}
+/**
+ * URL 验证（GET）：解密 echostr，返回需在响应体中回写的明文字符串
+ */
+function decryptUrlVerifyEchoStr(token, timestamp, nonce, echostr, msgSignature, encodingAesKey) {
+    if (!verifyMsgSignature(token, timestamp, nonce, echostr, msgSignature)) {
+        throw new Error("Invalid msg_signature for URL verify");
+    }
+    return decryptEncryptField(encodingAesKey, echostr, "");
+}
+/**
+ * 构造被动回复 JSON 包（含签名），写入 HTTP 响应体
+ */
+function buildEncryptedJsonResponse(token, encodingAesKey, plainJson, nonce) {
+    const encrypt = encryptToEncryptField(encodingAesKey, plainJson, "");
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const msgSignature = sha1Hex(sortAndJoin([token, timestamp, nonce, encrypt]));
+    const body = JSON.stringify({
+        encrypt,
+        // 官方字段名为 msg_signature；同时保留 msgsignature 兼容历史实现
+        msg_signature: msgSignature,
+        msgsignature: msgSignature,
+        timestamp: Number(timestamp),
+        nonce,
+    });
+    return { body, timestamp };
+}
+
+/**
  * 消息回复传输层：长连接（WebSocket）与 URL 回调（HTTP response_url）共用同一套业务逻辑。
  */
 function pickString(v) {
@@ -807,6 +915,48 @@ function createHttpCallbackReplyTransport() {
                 throwMissingResponseUrl(frame);
             }
             await sendWeComMarkdownHttp({ responseUrl, text, runtime });
+        },
+    };
+}
+/**
+ * 无 response_url 时：按官方「加密与被动回复」在同一次 POST 响应中返回密文包（见 path/101033）。
+ * 同一 TCP 响应只能写一次，因此仅处理 finish=true 的最终帧（中间 finish=false 由业务层跳过展示）。
+ */
+function createPassiveHttpEncryptedReplyTransport(params) {
+    const { res, token, encodingAesKey, nonce } = params;
+    function sendEncryptedPlainJson(plainJson, runtime) {
+        if (res.writableEnded) {
+            runtime.log?.(`[wecom] passive http: response already ended, skip`);
+            return;
+        }
+        const { body } = buildEncryptedJsonResponse(token, encodingAesKey, plainJson, nonce);
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.end(body);
+    }
+    return {
+        replyStream: async ({ streamId, text, finish, runtime }) => {
+            if (!finish) {
+                return;
+            }
+            const plain = JSON.stringify({
+                msgtype: "stream",
+                stream: {
+                    id: streamId,
+                    finish: true,
+                    content: text,
+                },
+            });
+            sendEncryptedPlainJson(plain, runtime);
+            runtime.log?.(`[wecom] passive http: sent encrypted stream reply (finish=true), len=${text.length}`);
+        },
+        sendMarkdownFallback: async ({ text, runtime }) => {
+            const plain = JSON.stringify({
+                msgtype: "markdown",
+                markdown: { content: text },
+            });
+            sendEncryptedPlainJson(plain, runtime);
+            runtime.log?.(`[wecom] passive http: sent encrypted markdown fallback, len=${text.length}`);
         },
     };
 }
@@ -2083,10 +2233,12 @@ async function routeAndDispatchMessage(params) {
  * 整体带超时保护，防止单条消息处理阻塞过久
  */
 async function processWeComMessage(params) {
-    const { frame, account, config, runtime, wsClient } = params;
+    const { frame, account, config, runtime, wsClient, passiveHttpReply } = params;
     const transport = wsClient
         ? createWebsocketReplyTransport(wsClient)
-        : createHttpCallbackReplyTransport();
+        : passiveHttpReply
+            ? createPassiveHttpEncryptedReplyTransport(passiveHttpReply)
+            : createHttpCallbackReplyTransport();
     const body = frame.body;
     const chatId = body.chatid || body.from.userid;
     const chatType = body.chattype === "group" ? "group" : "direct";
@@ -2095,7 +2247,7 @@ async function processWeComMessage(params) {
     // Step 1: 解析消息内容
     const { textParts, imageUrls, imageAesKeys, fileUrls, fileAesKeys, quoteContent } = parseMessageContent(body);
     let text = textParts.join("\n").trim();
-    runtime.log?.(`[wecom][trace] inbound: msgid=${body.msgid}, msgtype=${body.msgtype}, chattype=${body.chattype}, chatId=${chatId}, hasResponseUrl=${Boolean(body.response_url)}`);
+    runtime.log?.(`[wecom][trace] inbound: msgid=${body.msgid}, msgtype=${body.msgtype}, chattype=${body.chattype}, chatId=${chatId}, hasResponseUrl=${Boolean(resolveResponseUrl(frame))}, passiveHttp=${Boolean(passiveHttpReply)}`);
     // // 群聊中移除 @机器人 的提及标记
     // if (body.chattype === "group") {
     //   text = text.replace(/@\S+/g, "").trim();
@@ -2474,114 +2626,6 @@ function setWeComAccount(cfg, account) {
     };
 }
 
-/**
- * 企业微信智能机器人「接收消息 URL」模式下的 JSON 加解密（与官方 wxbizmsgcrypt 算法一致）。
- * receiveid 在企业自建智能机器人场景下传空字符串。
- *
- * @see https://developer.work.weixin.qq.com/document/path/101033
- */
-function sha1Hex(data) {
-    return crypto__namespace.createHash("sha1").update(data, "utf8").digest("hex");
-}
-function sortAndJoin(parts) {
-    return [...parts].sort().join("");
-}
-/**
- * 校验 msg_signature 是否与 token、timestamp、nonce、encrypt 一致
- */
-function verifyMsgSignature(token, timestamp, nonce, encrypt, msgSignature) {
-    const expect = sha1Hex(sortAndJoin([token, timestamp, nonce, encrypt]));
-    return expect === msgSignature;
-}
-function pkcs7Unpad(buf) {
-    const pad = buf[buf.length - 1];
-    if (pad < 1 || pad > 32)
-        return buf;
-    return buf.subarray(0, buf.length - pad);
-}
-function pkcs7Pad(buf) {
-    const block = 32;
-    const pad = block - (buf.length % block);
-    const out = Buffer.alloc(buf.length + pad);
-    buf.copy(out);
-    out.fill(pad, buf.length);
-    return out;
-}
-function decodeAesKey(encodingAesKey) {
-    const key = Buffer.from(encodingAesKey, "base64");
-    if (key.length !== 32) {
-        throw new Error(`Invalid EncodingAESKey: expected 32 bytes after base64 decode, got ${key.length}`);
-    }
-    return key;
-}
-/**
- * 解密 encrypt 字段（Base64 密文）得到 UTF-8 明文字符串（通常为 JSON）
- */
-function decryptEncryptField(encodingAesKey, encryptB64, receiveId = "") {
-    const aesKey = decodeAesKey(encodingAesKey);
-    const iv = aesKey.subarray(0, 16);
-    const cipher = Buffer.from(encryptB64, "base64");
-    const decipher = crypto__namespace.createDecipheriv("aes-256-cbc", aesKey, iv);
-    decipher.setAutoPadding(false);
-    const decrypted = Buffer.concat([decipher.update(cipher), decipher.final()]);
-    const unpadded = pkcs7Unpad(decrypted);
-    if (unpadded.length < 20) {
-        throw new Error("Decrypted payload too short");
-    }
-    const content = unpadded.subarray(16);
-    const msgLen = content.readUInt32BE(0);
-    const msg = content.subarray(4, 4 + msgLen).toString("utf8");
-    const tail = content.subarray(4 + msgLen).toString("utf8");
-    if (receiveId !== "" && tail !== receiveId) {
-        throw new Error("receiveId mismatch after decrypt");
-    }
-    return msg;
-}
-/**
- * 加密明文（通常为 JSON 字符串），得到 Base64 密文，用于被动回复包中的 encrypt 字段
- */
-function encryptToEncryptField(encodingAesKey, plainText, receiveId = "") {
-    const aesKey = decodeAesKey(encodingAesKey);
-    const iv = aesKey.subarray(0, 16);
-    const msgBuf = Buffer.from(plainText, "utf8");
-    const rand = crypto__namespace.randomBytes(16);
-    const lenBuf = Buffer.alloc(4);
-    lenBuf.writeUInt32BE(msgBuf.length, 0);
-    const tail = Buffer.from(receiveId, "utf8");
-    const packed = Buffer.concat([rand, lenBuf, msgBuf, tail]);
-    const padded = pkcs7Pad(packed);
-    const cipher = crypto__namespace.createCipheriv("aes-256-cbc", aesKey, iv);
-    cipher.setAutoPadding(false);
-    const encrypted = Buffer.concat([cipher.update(padded), cipher.final()]);
-    return encrypted.toString("base64");
-}
-/**
- * URL 验证（GET）：解密 echostr，返回需在响应体中回写的明文字符串
- */
-function decryptUrlVerifyEchoStr(token, timestamp, nonce, echostr, msgSignature, encodingAesKey) {
-    if (!verifyMsgSignature(token, timestamp, nonce, echostr, msgSignature)) {
-        throw new Error("Invalid msg_signature for URL verify");
-    }
-    return decryptEncryptField(encodingAesKey, echostr, "");
-}
-/**
- * 构造被动回复 JSON 包（含签名），写入 HTTP 响应体
- */
-function buildEncryptedJsonResponse(token, encodingAesKey, plainJson, nonce) {
-    const encrypt = encryptToEncryptField(encodingAesKey, plainJson, "");
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const msgSignature = sha1Hex(sortAndJoin([token, timestamp, nonce, encrypt]));
-    const body = JSON.stringify({
-        encrypt,
-        // 官方字段名为 msg_signature；同时保留 msgsignature 兼容历史实现
-        msg_signature: msgSignature,
-        msgsignature: msgSignature,
-        timestamp: Number(timestamp),
-        nonce,
-    });
-    return { body, timestamp };
-}
-
 let debugLogFile = path__namespace.resolve(process.cwd(), "wecom-debug.log");
 function toText(args) {
     return args
@@ -2804,6 +2848,30 @@ async function handleIncomingCallback(params) {
     if (frame.cmd !== aibotNodeSdk.WsCmd.CALLBACK) {
         runtimeEnv.log(`[wecom] http: skip cmd=${frame.cmd}`);
         sendEncryptedOk(res, token, encodingAesKey, nonce);
+        return;
+    }
+    const responseUrl = resolveResponseUrl(frame);
+    if (!responseUrl) {
+        runtimeEnv.log(`[wecom] http: callback has no response_url; will await agent reply and send passive encrypted HTTP body (doc 101033)`);
+        try {
+            await processWeComMessage({
+                frame,
+                account,
+                config: cfg,
+                runtime: runtimeEnv,
+                wsClient: null,
+                passiveHttpReply: { res, token, encodingAesKey, nonce },
+            });
+            if (!res.writableEnded) {
+                sendEncryptedOk(res, token, encodingAesKey, nonce);
+            }
+        }
+        catch (err) {
+            runtimeEnv.error(`[wecom] http callback process failed: ${String(err)}`);
+            if (!res.writableEnded) {
+                sendEncryptedOk(res, token, encodingAesKey, nonce);
+            }
+        }
         return;
     }
     sendEncryptedOk(res, token, encodingAesKey, nonce);

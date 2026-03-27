@@ -1,6 +1,7 @@
 /**
  * 消息回复传输层：长连接（WebSocket）与 URL 回调（HTTP response_url）共用同一套业务逻辑。
  */
+import type { ServerResponse } from "node:http";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import type { WsFrame } from "@wecom/aibot-node-sdk";
 import type { WSClient } from "@wecom/aibot-node-sdk";
@@ -19,5 +20,16 @@ export type WecomReplyTransport = {
         runtime: RuntimeEnv;
     }) => Promise<void>;
 };
+export declare function resolveResponseUrl(frame: WsFrame): string | undefined;
 export declare function createWebsocketReplyTransport(wsClient: WSClient): WecomReplyTransport;
 export declare function createHttpCallbackReplyTransport(): WecomReplyTransport;
+/**
+ * 无 response_url 时：按官方「加密与被动回复」在同一次 POST 响应中返回密文包（见 path/101033）。
+ * 同一 TCP 响应只能写一次，因此仅处理 finish=true 的最终帧（中间 finish=false 由业务层跳过展示）。
+ */
+export declare function createPassiveHttpEncryptedReplyTransport(params: {
+    res: ServerResponse;
+    token: string;
+    encodingAesKey: string;
+    nonce: string;
+}): WecomReplyTransport;

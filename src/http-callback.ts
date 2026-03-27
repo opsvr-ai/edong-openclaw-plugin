@@ -17,6 +17,7 @@ import { processWeComMessage } from "./monitor.js";
 import { resolveWeComAccount, type ResolvedWeComAccount } from "./utils.js";
 import { CHANNEL_ID } from "./const.js";
 import { wrapRuntimeEnvWithDebug } from "./debug-log.js";
+import { resolveResponseUrl } from "./wecom-transport.js";
 
 const DEFAULT_CALLBACK_PATH = "/channels/wecom/callback";
 
@@ -222,6 +223,32 @@ async function handleIncomingCallback(params: {
   if (frame.cmd !== WsCmd.CALLBACK) {
     runtimeEnv.log(`[wecom] http: skip cmd=${frame.cmd}`);
     sendEncryptedOk(res, token, encodingAesKey, nonce);
+    return;
+  }
+
+  const responseUrl = resolveResponseUrl(frame);
+  if (!responseUrl) {
+    runtimeEnv.log(
+      `[wecom] http: callback has no response_url; will await agent reply and send passive encrypted HTTP body (doc 101033)`,
+    );
+    try {
+      await processWeComMessage({
+        frame,
+        account,
+        config: cfg,
+        runtime: runtimeEnv,
+        wsClient: null,
+        passiveHttpReply: { res, token, encodingAesKey, nonce },
+      });
+      if (!res.writableEnded) {
+        sendEncryptedOk(res, token, encodingAesKey, nonce);
+      }
+    } catch (err) {
+      runtimeEnv.error(`[wecom] http callback process failed: ${String(err)}`);
+      if (!res.writableEnded) {
+        sendEncryptedOk(res, token, encodingAesKey, nonce);
+      }
+    }
     return;
   }
 
