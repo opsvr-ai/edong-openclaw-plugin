@@ -56,6 +56,8 @@ export declare function processWeComMessage(params: {
         encodingAesKey: string;
         nonce: string;
     };
+    /** URL 回调 query 中的 nonce，用于 MessageSid 去重键（与 msgid 组合）；长连接模式勿传 */
+    httpCallbackQueryNonce?: string;
 }): Promise<void>;
 /**
  * 监听企业微信 WebSocket 连接

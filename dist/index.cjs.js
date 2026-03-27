@@ -1916,7 +1916,7 @@ function buildMediaErrorSummary(mediaUrl, result) {
 /**
  * 构建消息上下文
  */
-function buildMessageContext(frame, account, config, text, mediaList, quoteContent) {
+function buildMessageContext(frame, account, config, text, mediaList, quoteContent, opts) {
     const core = getWeComRuntime();
     const body = frame.body;
     const chatId = body.chatid || body.from.userid;
@@ -1941,10 +1941,16 @@ function buildMessageContext(frame, account, config, text, mediaList, quoteConte
     const mediaTypes = mediaList.length > 0
         ? mediaList.map((m) => m.contentType).filter(Boolean)
         : undefined;
-    // OpenClaw 入站去重键包含 MessageSid；若仅使用 msgid，企微重试或异常场景下可能与上一条碰撞导致第二条被静默跳过。
-    // 官方消息体常带 create_time（秒），与 msgid 组合可区分不同入站事件。
+    // OpenClaw 入站去重键包含 MessageSid（见 inbound-dedupe.ts：provider|account|session|peer|thread|MessageSid）。
+    // 仅用 msgid 时，企微侧可能对多条用户消息复用同一 msgid，或与其他字段组合后与上一条碰撞，导致第二条被静默去重（deliver 永不执行）。
+    // URL 回调每次 POST 的 query.nonce 在约 2h 内唯一（官方要求），与 msgid 组合可稳定区分每次 HTTP 入站。
     const createTime = typeof body.create_time === "number" ? body.create_time : undefined;
-    const messageSidForDedupe = createTime !== undefined ? `${body.msgid}:${createTime}` : body.msgid;
+    const queryNonce = opts?.httpCallbackQueryNonce?.trim();
+    const messageSidForDedupe = queryNonce
+        ? `${body.msgid}:${queryNonce}`
+        : createTime !== undefined
+            ? `${body.msgid}:${createTime}`
+            : body.msgid;
     // 构建标准消息上下文
     return core.channel.reply.finalizeInboundContext({
         Body: messageBody,
@@ -2250,7 +2256,7 @@ async function routeAndDispatchMessage(params) {
  * 整体带超时保护，防止单条消息处理阻塞过久
  */
 async function processWeComMessage(params) {
-    const { frame, account, config, runtime, wsClient, passiveHttpReply } = params;
+    const { frame, account, config, runtime, wsClient, passiveHttpReply, httpCallbackQueryNonce } = params;
     const transport = wsClient
         ? createWebsocketReplyTransport(wsClient)
         : passiveHttpReply
@@ -2346,7 +2352,11 @@ async function processWeComMessage(params) {
     //   await sendThinkingReply({ wsClient, frame, streamId, runtime });
     // }
     // Step 7: 构建上下文并路由到核心处理流程（带整体超时保护）
-    const ctxPayload = buildMessageContext(frame, account, config, text, mediaList, quoteContent);
+    const ctxPayload = buildMessageContext(frame, account, config, text, mediaList, quoteContent, {
+        httpCallbackQueryNonce: wsClient
+            ? undefined
+            : (httpCallbackQueryNonce ?? passiveHttpReply?.nonce),
+    });
     // runtime.log?.(`[plugin -> openclaw] body=${text}, mediaPaths=${JSON.stringify(mediaList.map(m => m.path))}${quoteContent ? `, quote=${quoteContent}` : ''}`);
     try {
         await routeAndDispatchMessage({
@@ -2906,6 +2916,7 @@ async function handleIncomingCallback(params) {
         config: cfg,
         runtime: runtimeEnv,
         wsClient: null,
+        httpCallbackQueryNonce: nonce,
     }).catch((err) => {
         runtimeEnv.error(`[wecom] http callback process failed: ${String(err)}`);
     });

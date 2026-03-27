@@ -277,6 +277,7 @@ async function handleIncomingCallback(params: {
     config: cfg,
     runtime: runtimeEnv,
     wsClient: null,
+    httpCallbackQueryNonce: nonce,
   }).catch((err) => {
     runtimeEnv.error(`[wecom] http callback process failed: ${String(err)}`);
   });
