@@ -39,6 +39,12 @@ export interface MessageBody {
     url?: string;
     aeskey?: string;
   };
+  video?: {
+    url?: string;
+    aeskey?: string;
+  };
+  /** 事件/消息时间戳（秒），用于与 msgid 组合避免入站去重误判 */
+  create_time?: number;
   quote?: {
     msgtype: string;
     text?: { content: string };
@@ -109,6 +115,13 @@ export function parseMessageContent(body: MessageBody): ParsedMessageContent {
       fileUrls.push(body.file.url);
       if (body.file.aeskey) {
         fileAesKeys.set(body.file.url, body.file.aeskey);
+      }
+    }
+    // 视频消息（与文件类似：加密 URL + aeskey）
+    if (body.msgtype === "video" && body.video?.url) {
+      fileUrls.push(body.video.url);
+      if (body.video.aeskey) {
+        fileAesKeys.set(body.video.url, body.video.aeskey);
       }
     }
   }

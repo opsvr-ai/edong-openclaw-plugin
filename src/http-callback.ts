@@ -226,6 +226,23 @@ async function handleIncomingCallback(params: {
     return;
   }
 
+  // 流式刷新回调（msgtype=stream，无用户文本）：不是新一轮用户发言，不应走 agent；否则会「空内容跳过」且无明确日志。
+  const streamCheck = frame.body as {
+    msgtype?: string;
+    stream?: { id?: string };
+    text?: { content?: string };
+  };
+  if (
+    streamCheck.msgtype === "stream" &&
+    !streamCheck.text?.content?.trim()
+  ) {
+    runtimeEnv.log(
+      `[wecom] http: msgtype=stream without user text (stream refresh id=${streamCheck.stream?.id ?? "n/a"}), ack empty only`,
+    );
+    sendEncryptedOk(res, token, encodingAesKey, nonce);
+    return;
+  }
+
   const responseUrl = resolveResponseUrl(frame);
   if (!responseUrl) {
     runtimeEnv.log(

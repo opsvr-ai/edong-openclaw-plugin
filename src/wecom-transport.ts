@@ -32,9 +32,12 @@ function pickString(v: unknown): string | undefined {
 
 export function resolveResponseUrl(frame: WsFrame): string | undefined {
   const body = (frame.body ?? {}) as Record<string, unknown>;
+  const root = frame as unknown as Record<string, unknown>;
   return (
     pickString(body.response_url) ??
     pickString(body.responseUrl) ??
+    pickString(root.response_url) ??
+    pickString(root.responseUrl) ??
     pickString((body.data as Record<string, unknown> | undefined)?.response_url) ??
     pickString((body.data as Record<string, unknown> | undefined)?.responseUrl) ??
     pickString((body.message as Record<string, unknown> | undefined)?.response_url) ??

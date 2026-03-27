@@ -39,6 +39,12 @@ export interface MessageBody {
         url?: string;
         aeskey?: string;
     };
+    video?: {
+        url?: string;
+        aeskey?: string;
+    };
+    /** 事件/消息时间戳（秒），用于与 msgid 组合避免入站去重误判 */
+    create_time?: number;
     quote?: {
         msgtype: string;
         text?: {

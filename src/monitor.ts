@@ -199,13 +199,19 @@ function buildMessageContext(
     ? (mediaList.map((m) => m.contentType).filter(Boolean) as string[])
     : undefined;
 
+  // OpenClaw 入站去重键包含 MessageSid；若仅使用 msgid，企微重试或异常场景下可能与上一条碰撞导致第二条被静默跳过。
+  // 官方消息体常带 create_time（秒），与 msgid 组合可区分不同入站事件。
+  const createTime = typeof body.create_time === "number" ? body.create_time : undefined;
+  const messageSidForDedupe =
+    createTime !== undefined ? `${body.msgid}:${createTime}` : body.msgid;
+
   // 构建标准消息上下文
   return core.channel.reply.finalizeInboundContext({
     Body: messageBody,
     RawBody: messageBody,
     CommandBody: messageBody,
 
-    MessageSid: body.msgid,
+    MessageSid: messageSidForDedupe,
 
     From: chatType === "group" ? `${CHANNEL_ID}:group:${chatId}` : `${CHANNEL_ID}:${body.from.userid}`,
     To: `${CHANNEL_ID}:${chatId}`,
@@ -528,6 +534,12 @@ async function routeAndDispatchMessage(params: {
     runtime.log?.(
       `[wecom][trace] dispatch done: deliverCalled=${Boolean(state.deliverCalled)}, accumulatedTextLen=${state.accumulatedText.length}`,
     );
+
+    if (!state.deliverCalled) {
+      runtime.error?.(
+        `[wecom][warn] dispatch finished but deliver never ran — inbound may have been deduped/skipped by OpenClaw, or agent produced no blocks. msgid=${(frame.body as MessageBody).msgid}`,
+      );
+    }
 
     // 关闭 thinking 流
     await finishThinkingStream(ctx);

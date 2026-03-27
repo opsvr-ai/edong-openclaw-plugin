@@ -543,6 +543,13 @@ function parseMessageContent(body) {
                 fileAesKeys.set(body.file.url, body.file.aeskey);
             }
         }
+        // 视频消息（与文件类似：加密 URL + aeskey）
+        if (body.msgtype === "video" && body.video?.url) {
+            fileUrls.push(body.video.url);
+            if (body.video.aeskey) {
+                fileAesKeys.set(body.video.url, body.video.aeskey);
+            }
+        }
     }
     // 处理引用消息
     if (body.quote) {
@@ -844,8 +851,11 @@ function pickString(v) {
 }
 function resolveResponseUrl(frame) {
     const body = (frame.body ?? {});
+    const root = frame;
     return (pickString(body.response_url) ??
         pickString(body.responseUrl) ??
+        pickString(root.response_url) ??
+        pickString(root.responseUrl) ??
         pickString(body.data?.response_url) ??
         pickString(body.data?.responseUrl) ??
         pickString(body.message?.response_url) ??
@@ -1903,12 +1913,16 @@ function buildMessageContext(frame, account, config, text, mediaList, quoteConte
     const mediaTypes = mediaList.length > 0
         ? mediaList.map((m) => m.contentType).filter(Boolean)
         : undefined;
+    // OpenClaw 入站去重键包含 MessageSid；若仅使用 msgid，企微重试或异常场景下可能与上一条碰撞导致第二条被静默跳过。
+    // 官方消息体常带 create_time（秒），与 msgid 组合可区分不同入站事件。
+    const createTime = typeof body.create_time === "number" ? body.create_time : undefined;
+    const messageSidForDedupe = createTime !== undefined ? `${body.msgid}:${createTime}` : body.msgid;
     // 构建标准消息上下文
     return core.channel.reply.finalizeInboundContext({
         Body: messageBody,
         RawBody: messageBody,
         CommandBody: messageBody,
-        MessageSid: body.msgid,
+        MessageSid: messageSidForDedupe,
         From: chatType === "group" ? `${CHANNEL_ID}:group:${chatId}` : `${CHANNEL_ID}:${body.from.userid}`,
         To: `${CHANNEL_ID}:${chatId}`,
         SenderId: body.from.userid,
@@ -2173,6 +2187,9 @@ async function routeAndDispatchMessage(params) {
             },
         });
         runtime.log?.(`[wecom][trace] dispatch done: deliverCalled=${Boolean(state.deliverCalled)}, accumulatedTextLen=${state.accumulatedText.length}`);
+        if (!state.deliverCalled) {
+            runtime.error?.(`[wecom][warn] dispatch finished but deliver never ran — inbound may have been deduped/skipped by OpenClaw, or agent produced no blocks. msgid=${frame.body.msgid}`);
+        }
         // 关闭 thinking 流
         await finishThinkingStream(ctx);
         safeCleanup();
@@ -2819,6 +2836,14 @@ async function handleIncomingCallback(params) {
     }
     if (frame.cmd !== WsCmd.CALLBACK) {
         runtimeEnv.log(`[wecom] http: skip cmd=${frame.cmd}`);
+        sendEncryptedOk(res, token, encodingAesKey, nonce);
+        return;
+    }
+    // 流式刷新回调（msgtype=stream，无用户文本）：不是新一轮用户发言，不应走 agent；否则会「空内容跳过」且无明确日志。
+    const streamCheck = frame.body;
+    if (streamCheck.msgtype === "stream" &&
+        !streamCheck.text?.content?.trim()) {
+        runtimeEnv.log(`[wecom] http: msgtype=stream without user text (stream refresh id=${streamCheck.stream?.id ?? "n/a"}), ack empty only`);
         sendEncryptedOk(res, token, encodingAesKey, nonce);
         return;
     }
