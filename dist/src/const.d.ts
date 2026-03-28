@@ -22,14 +22,15 @@ export declare enum WeComCommand {
 export declare const IMAGE_DOWNLOAD_TIMEOUT_MS = 30000;
 /** 文件下载超时时间（毫秒） */
 export declare const FILE_DOWNLOAD_TIMEOUT_MS = 60000;
-/**
- * 企微 HTTP：入站「接收消息 URL」长连接 + 主动回复 POST response_url 共用超时（毫秒）
- */
-export declare const WECOM_HTTP_TIMEOUT_MS: number;
-/** 消息发送超时时间（毫秒），与 {@link WECOM_HTTP_TIMEOUT_MS} 一致 */
-export declare const REPLY_SEND_TIMEOUT_MS: number;
+/** 主动回复 POST（response_url / doc 101138）单次请求超时（毫秒） */
+export declare const REPLY_SEND_TIMEOUT_MS = 120000;
 /** 消息处理总超时时间（毫秒） */
 export declare const MESSAGE_PROCESS_TIMEOUT_MS: number;
+/**
+ * URL 回调入站 TCP 保持时间（毫秒）。被动回复需在同连接返回密文（doc 101033），且流式场景企微最多约 6 分钟轮询刷新（doc 100719）。
+ * 与网关/反代超时一并调大，避免长耗时回复被提前断开。
+ */
+export declare const WECOM_HTTP_INBOUND_TIMEOUT_MS: number;
 /** WebSocket 心跳间隔（毫秒） */
 export declare const WS_HEARTBEAT_INTERVAL_MS = 30000;
 /** WebSocket 连接断开时的最大重连次数 */

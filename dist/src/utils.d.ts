@@ -42,12 +42,6 @@ export interface WeComConfig {
     groups?: Record<string, WeComGroupConfig>;
     /** 是否发送"思考中"消息，默认为 true */
     sendThinkingMessage?: boolean;
-    /**
-     * 是否使用流式回复（多段 finish=false + 最终 finish=true）。
-     * 设为 false 时仅最终一条 Markdown/文本（无流式打字效果），适合 HTTP 被动或希望减少连接占用。
-     * 默认 true（保持与历史行为一致）。
-     */
-    streamReply?: boolean;
     /** 额外允许访问的本地媒体路径白名单（支持 ~ 表示 home 目录），如 ["~/Downloads", "~/Documents"] */
     mediaLocalRoots?: string[];
 }
@@ -66,8 +60,6 @@ export interface ResolvedWeComAccount {
     encodingAesKey: string;
     /** 是否发送"思考中"消息，默认为 true */
     sendThinkingMessage: boolean;
-    /** 是否流式输出；false 时仅最终一条非流式消息 */
-    streamReply: boolean;
     config: WeComConfig;
 }
 /**

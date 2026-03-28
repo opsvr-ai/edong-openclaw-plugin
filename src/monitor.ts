@@ -55,7 +55,6 @@ import { checkGroupPolicy } from "./group-policy.js";
 import { checkDmPolicy } from "./dm-policy.js";
 import {
   setWeComWebSocket,
-  getWeComWebSocket,
   setMessageState,
   deleteMessageState,
   setReqIdForChat,
@@ -247,7 +246,14 @@ function buildMessageContext(
 
     CommandAuthorized: true,
 
-    ResponseUrl: resolveResponseUrl(frame),
+    ResponseUrl:
+      resolveResponseUrl(frame) ||
+      body.response_url ||
+      (body as unknown as { responseUrl?: string }).responseUrl ||
+      (body as unknown as { data?: { response_url?: string; responseUrl?: string } }).data?.response_url ||
+      (body as unknown as { data?: { response_url?: string; responseUrl?: string } }).data?.responseUrl ||
+      (body as unknown as { message?: { response_url?: string; responseUrl?: string } }).message?.response_url ||
+      (body as unknown as { message?: { response_url?: string; responseUrl?: string } }).message?.responseUrl,
     ReqId: frame.headers.req_id,
     WeComFrame: frame,
 
@@ -387,23 +393,6 @@ async function finishThinkingStream(ctx: DeliverContext): Promise<void> {
   const chatId = body.chatid || body.from.userid;
   let finishText: string = state.accumulatedText;
 
-  /** 非流式：仅发一条 Markdown，不走 replyStream（含 finish=true） */
-  if (account.streamReply === false) {
-    if (state.hasMedia) {
-      if (state.hasMediaFailed && state.mediaErrorSummary) {
-        finishText = finishText ? `${finishText}\n\n${state.mediaErrorSummary}` : state.mediaErrorSummary;
-      } else if (!finishText) {
-        finishText = "📎 文件已发送，请查收。";
-      }
-    }
-    if (!finishText) {
-      finishText = "⚠️ 本次未生成可发送内容，请重试一次，或换一种问法。";
-    }
-    runtime.log?.(`[wecom] streamReply=false → single markdown send, len=${finishText.length}`);
-    await transport.sendMarkdownFallback({ frame, chatId, text: finishText, runtime });
-    return;
-  }
-
   if (state.hasMedia) {
     if (state.hasMediaFailed && state.mediaErrorSummary) {
       // 媒体成功发送：用友好提示告知用户
@@ -476,7 +465,6 @@ async function routeAndDispatchMessage(params: {
   };
 
   let isShowThink = !(account.sendThinkingMessage ?? true);
-  const useStreamReply = account.streamReply !== false;
 
   try {
     runtime.log?.(
@@ -504,9 +492,6 @@ async function routeAndDispatchMessage(params: {
           runtime.log?.(
             `[wecom][trace] onReplyStart: streamId=${state.streamId}, hasAccumulated=${Boolean(state.accumulatedText)}`,
           );
-          if (!useStreamReply) {
-            return;
-          }
           if (!isShowThink && state.streamId && !state.accumulatedText) {
             try {
               await sendThinkingReply({ transport, frame, streamId: state.streamId!, runtime, state })
@@ -545,13 +530,8 @@ async function routeAndDispatchMessage(params: {
             }
           }
 
-          // 中间帧：有可见文本时流式更新（非流式模式或非流式配置时跳过）
-          if (
-            useStreamReply &&
-            info.kind !== "final" &&
-            state.accumulatedText &&
-            !state.streamExpired
-          ) {
+          // 中间帧：有可见文本时流式更新（流式过期后跳过，等 deliver 完成后主动发送）
+          if (info.kind !== "final" && state.accumulatedText && !state.streamExpired) {
             try {
               await transport.replyStream({
                 frame,
@@ -624,8 +604,7 @@ export async function processWeComMessage(params: {
   /** URL 回调模式下为 null */
   wsClient: WSClient | null;
   /**
-   * 无 response_url 时：在同一次企微 POST 回调的 HTTP 响应中返回加密被动回复（path/101033）。
-   * 若同时已建立长连接，http-callback 会先空包应答，再传入 wsClient 走本分支，用流式主动发回复（与「先空包 + 异步」一致）。
+   * 无 response_url 时：在同一次企微 POST 回调的 HTTP 响应中返回加密被动回复（path/101033），不能与先发空包再异步回复混用。
    */
   passiveHttpReply?: {
     res: ServerResponse;
@@ -633,31 +612,19 @@ export async function processWeComMessage(params: {
     encodingAesKey: string;
     nonce: string;
   };
-  /** URL 回调 query 中的 nonce，用于 MessageSid 去重键（与 msgid 组合）；纯长连接入站勿传 */
+  /** URL 回调 query 中的 nonce，用于 MessageSid 去重键（与 msgid 组合）；长连接模式勿传 */
   httpCallbackQueryNonce?: string;
-  /** 显式指定 HTTP 入站 invocation id（一般无需传，由内部 randomUUID） */
-  httpInvocationId?: string;
 }): Promise<void> {
-  const { frame, account, config, runtime, wsClient, passiveHttpReply, httpCallbackQueryNonce, httpInvocationId: httpInvocationIdParam } = params;
-  const nonceForSid = (httpCallbackQueryNonce ?? passiveHttpReply?.nonce)?.trim();
-  /** HTTP 入站（带 query nonce）或纯 HTTP 无 WS：为每条处理生成 invocation，避免 OpenClaw 入站去重误判 */
-  const httpInvocationId =
-    httpInvocationIdParam?.trim() ??
-    (nonceForSid || !wsClient ? randomUUID() : undefined);
-  const body = frame.body as MessageBody;
-  const chatId = body.chatid || body.from.userid;
+  const { frame, account, config, runtime, wsClient, passiveHttpReply, httpCallbackQueryNonce } = params;
+  /** 仅 HTTP 回调：每条处理独立 id，避免 OpenClaw 入站去重在长耗时/失败后把重试误判为重复 */
+  const httpInvocationId = wsClient ? undefined : randomUUID();
   const transport = wsClient
     ? createWebsocketReplyTransport(wsClient)
     : passiveHttpReply
-      ? createPassiveHttpEncryptedReplyTransport({
-          ...passiveHttpReply,
-          proactiveFallback: {
-            frame,
-            chatId,
-            wsClient: wsClient ?? getWeComWebSocket(account.accountId),
-          },
-        })
+      ? createPassiveHttpEncryptedReplyTransport(passiveHttpReply)
       : createHttpCallbackReplyTransport();
+  const body = frame.body as MessageBody;
+  const chatId = body.chatid || body.from.userid;
   const chatType = body.chattype === "group" ? "group" : "direct";
   const messageId = body.msgid;
   const reqId = frame.headers.req_id;
@@ -764,7 +731,9 @@ export async function processWeComMessage(params: {
 
   // Step 7: 构建上下文并路由到核心处理流程（带整体超时保护）
   const ctxPayload = buildMessageContext(frame, account, config, text, mediaList, quoteContent, {
-    httpCallbackQueryNonce: nonceForSid,
+    httpCallbackQueryNonce: wsClient
+      ? undefined
+      : (httpCallbackQueryNonce ?? passiveHttpReply?.nonce),
     httpInvocationId,
   });
   // runtime.log?.(`[plugin -> openclaw] body=${text}, mediaPaths=${JSON.stringify(mediaList.map(m => m.path))}${quoteContent ? `, quote=${quoteContent}` : ''}`);

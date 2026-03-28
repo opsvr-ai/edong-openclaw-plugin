@@ -15,7 +15,7 @@ import {
 import { getWeComRuntime } from "./runtime.js";
 import { processWeComMessage } from "./monitor.js";
 import { resolveWeComAccount, type ResolvedWeComAccount } from "./utils.js";
-import { CHANNEL_ID, WECOM_HTTP_TIMEOUT_MS } from "./const.js";
+import { CHANNEL_ID, WECOM_HTTP_INBOUND_TIMEOUT_MS } from "./const.js";
 import { wrapRuntimeEnvWithDebug } from "./debug-log.js";
 import { resolveResponseUrl } from "./wecom-transport.js";
 import { getWeComWebSocket } from "./state-manager.js";
@@ -23,10 +23,8 @@ import { getWeComWebSocket } from "./state-manager.js";
 const DEFAULT_CALLBACK_PATH = "/channels/wecom/callback";
 
 /**
- * 无 response_url 时：同一条用户消息在长耗时下可能被企微重试，产生第二条 POST（新 TCP、新 res）。
- * 若并行跑两次 processWeComMessage，后到的请求可能被 OpenClaw 入站去重跳过，却先结束 HTTP 并写入兜底短文案；
- * 先到的连接稍后写完完整密文，客户端表现混乱或像「第二次无响应」。
- * 对同一 msgid 串行：仅第一条进入 agent，重复 POST 只 ack 空包。
+ * 无 response_url 时：同 msgid 可能被企微重试并发 POST；串行避免双开 agent、响应混乱。
+ * 长连接混合路径先空包，锁释放时机与异步 process 结束对齐。
  */
 const passiveHttpInFlightMsgids = new Set<string>();
 
@@ -167,8 +165,7 @@ async function handleIncomingCallback(params: {
     return;
   }
 
-  // 被动回复需在同 TCP 连接上返回密文；拉长 socket 超时，避免网关/Node 默认在 2min 内掐断
-  req.setTimeout(WECOM_HTTP_TIMEOUT_MS);
+  req.setTimeout(WECOM_HTTP_INBOUND_TIMEOUT_MS);
 
   let raw: string;
   try {
@@ -258,9 +255,15 @@ async function handleIncomingCallback(params: {
   const responseUrl = resolveResponseUrl(frame);
   if (!responseUrl) {
     const msgid = (frame.body as { msgid?: string } | undefined)?.msgid?.trim();
+    const releaseMsgidLock = () => {
+      if (msgid) {
+        passiveHttpInFlightMsgids.delete(msgid);
+      }
+    };
+
     if (msgid && passiveHttpInFlightMsgids.has(msgid)) {
       runtimeEnv.log(
-        `[wecom] http: passive duplicate POST while first still in-flight (msgid=${msgid}), ack empty encrypted only`,
+        `[wecom] http: duplicate POST while first still in-flight (msgid=${msgid}), ack empty encrypted only`,
       );
       sendEncryptedOk(res, token, encodingAesKey, nonce);
       return;
@@ -269,16 +272,10 @@ async function handleIncomingCallback(params: {
       passiveHttpInFlightMsgids.add(msgid);
     }
 
-    const releaseMsgidLock = () => {
-      if (msgid) {
-        passiveHttpInFlightMsgids.delete(msgid);
-      }
-    };
-
     const ws = getWeComWebSocket(account.accountId);
     if (ws?.isConnected) {
       runtimeEnv.log(
-        `[wecom] http: no response_url but WS connected → ack empty encrypted, then async proactive reply via stream (hybrid)`,
+        `[wecom] http: no response_url but WS connected → ack empty encrypted, then reply via long connection (doc 101039 / 101463 hybrid)`,
       );
       sendEncryptedOk(res, token, encodingAesKey, nonce);
       void processWeComMessage({
@@ -297,7 +294,7 @@ async function handleIncomingCallback(params: {
     }
 
     runtimeEnv.log(
-      `[wecom] http: no active reply URL (101138) and WS offline → passive encrypted body in same HTTP response (doc 101033); ensure callback includes response_url or response_code, or configure websocketUrl/secret for hybrid`,
+      `[wecom] http: no response_url and WS offline → passive encrypted reply on same HTTP (doc 101033); ensure gateway timeout ≥ ${WECOM_HTTP_INBOUND_TIMEOUT_MS / 1000}s`,
     );
     try {
       await processWeComMessage({
@@ -323,9 +320,6 @@ async function handleIncomingCallback(params: {
     return;
   }
 
-  runtimeEnv.log(
-    `[wecom] http: active reply URL resolved (doc 101138 https://developer.work.weixin.qq.com/document/path/101138); ack empty encrypted, then async POST to response_url`,
-  );
   sendEncryptedOk(res, token, encodingAesKey, nonce);
 
   void processWeComMessage({
