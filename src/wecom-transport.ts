@@ -170,6 +170,43 @@ export function createHttpCallbackReplyTransport(): WecomReplyTransport {
 }
 
 /**
+ * 被动 HTTP 无法写回同一 TCP（已结束/写入失败）时，按 path/101138 用 response_url POST markdown，
+ * 或长连接 sendMessage(markdown) 主动推送。
+ */
+export async function tryProactiveMarkdownFallback(params: {
+  frame: WsFrame;
+  chatId: string;
+  text: string;
+  runtime: RuntimeEnv;
+  wsClient: WSClient | null;
+}): Promise<boolean> {
+  const { frame, chatId, text, runtime, wsClient } = params;
+  const url = resolveResponseUrl(frame);
+  if (url) {
+    try {
+      await sendWeComMarkdownHttp({ responseUrl: url, text, runtime });
+      runtime.log?.(`[wecom] proactive markdown fallback ok (response_url)`);
+      return true;
+    } catch (e) {
+      runtime.error?.(`[wecom] proactive markdown via response_url failed: ${String(e)}`);
+    }
+  }
+  if (wsClient?.isConnected) {
+    try {
+      await wsClient.sendMessage(chatId, {
+        msgtype: "markdown",
+        markdown: { content: text },
+      });
+      runtime.log?.(`[wecom] proactive markdown fallback ok (WS)`);
+      return true;
+    } catch (e) {
+      runtime.error?.(`[wecom] proactive markdown via WS failed: ${String(e)}`);
+    }
+  }
+  return false;
+}
+
+/**
  * 无 response_url 时：按官方「加密与被动回复」在同一次 POST 响应中返回密文包（见 path/101033）。
  * 同一 TCP 响应只能写一次，因此仅处理 finish=true 的最终帧（中间 finish=false 由业务层跳过展示）。
  */
@@ -178,18 +215,58 @@ export function createPassiveHttpEncryptedReplyTransport(params: {
   token: string;
   encodingAesKey: string;
   nonce: string;
+  /** 被动连接已不可用时的主动推送兜底（response_url 优先，其次 WS） */
+  proactiveFallback?: {
+    frame: WsFrame;
+    chatId: string;
+    wsClient: WSClient | null;
+  };
 }): WecomReplyTransport {
-  const { res, token, encodingAesKey, nonce } = params;
+  const { res, token, encodingAesKey, nonce, proactiveFallback } = params;
 
-  function sendEncryptedPlainJson(plainJson: string, runtime: RuntimeEnv): void {
+  async function sendEncryptedBodyOrFallback(
+    plainJson: string,
+    fallbackText: string,
+    runtime: RuntimeEnv,
+    logOk: string,
+  ): Promise<void> {
     if (res.writableEnded) {
-      runtime.log?.(`[wecom] passive http: response already ended, skip`);
+      runtime.log?.(`[wecom] passive http: response already ended, try proactive fallback`);
+      if (proactiveFallback) {
+        const ok = await tryProactiveMarkdownFallback({
+          frame: proactiveFallback.frame,
+          chatId: proactiveFallback.chatId,
+          text: fallbackText,
+          runtime,
+          wsClient: proactiveFallback.wsClient,
+        });
+        if (!ok) {
+          runtime.error?.(`[wecom] passive http: proactive fallback failed (no usable response_url or WS)`);
+        }
+      }
       return;
     }
-    const { body } = buildEncryptedJsonResponse(token, encodingAesKey, plainJson, nonce);
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.end(body);
+    try {
+      const { body } = buildEncryptedJsonResponse(token, encodingAesKey, plainJson, nonce);
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.end(body);
+      runtime.log?.(logOk);
+    } catch (e) {
+      runtime.error?.(`[wecom] passive http: encrypted reply write failed: ${String(e)}`);
+      if (proactiveFallback) {
+        const ok = await tryProactiveMarkdownFallback({
+          frame: proactiveFallback.frame,
+          chatId: proactiveFallback.chatId,
+          text: fallbackText,
+          runtime,
+          wsClient: proactiveFallback.wsClient,
+        });
+        if (!ok) {
+          runtime.error?.(`[wecom] passive http: proactive fallback after write error also failed`);
+        }
+      }
+    }
   }
 
   return {
@@ -205,16 +282,24 @@ export function createPassiveHttpEncryptedReplyTransport(params: {
           content: text,
         },
       });
-      sendEncryptedPlainJson(plain, runtime);
-      runtime.log?.(`[wecom] passive http: sent encrypted stream reply (finish=true), len=${text.length}`);
+      await sendEncryptedBodyOrFallback(
+        plain,
+        text,
+        runtime,
+        `[wecom] passive http: sent encrypted stream reply (finish=true), len=${text.length}`,
+      );
     },
     sendMarkdownFallback: async ({ text, runtime }) => {
       const plain = JSON.stringify({
         msgtype: "markdown",
         markdown: { content: text },
       });
-      sendEncryptedPlainJson(plain, runtime);
-      runtime.log?.(`[wecom] passive http: sent encrypted markdown fallback, len=${text.length}`);
+      await sendEncryptedBodyOrFallback(
+        plain,
+        text,
+        runtime,
+        `[wecom] passive http: sent encrypted markdown fallback, len=${text.length}`,
+      );
     },
   };
 }

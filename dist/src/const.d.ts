@@ -22,8 +22,12 @@ export declare enum WeComCommand {
 export declare const IMAGE_DOWNLOAD_TIMEOUT_MS = 30000;
 /** 文件下载超时时间（毫秒） */
 export declare const FILE_DOWNLOAD_TIMEOUT_MS = 60000;
-/** 消息发送超时时间（毫秒） */
-export declare const REPLY_SEND_TIMEOUT_MS = 15000;
+/**
+ * 企微 HTTP：入站「接收消息 URL」长连接 + 主动回复 POST response_url 共用超时（毫秒）
+ */
+export declare const WECOM_HTTP_TIMEOUT_MS: number;
+/** 消息发送超时时间（毫秒），与 {@link WECOM_HTTP_TIMEOUT_MS} 一致 */
+export declare const REPLY_SEND_TIMEOUT_MS: number;
 /** 消息处理总超时时间（毫秒） */
 export declare const MESSAGE_PROCESS_TIMEOUT_MS: number;
 /** WebSocket 心跳间隔（毫秒） */

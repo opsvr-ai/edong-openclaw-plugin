@@ -447,8 +447,12 @@ var WeComCommand;
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 30000;
 /** 文件下载超时时间（毫秒） */
 const FILE_DOWNLOAD_TIMEOUT_MS = 60000;
-/** 消息发送超时时间（毫秒） */
-const REPLY_SEND_TIMEOUT_MS = 15000;
+/**
+ * 企微 HTTP：入站「接收消息 URL」长连接 + 主动回复 POST response_url 共用超时（毫秒）
+ */
+const WECOM_HTTP_TIMEOUT_MS = 5 * 60 * 1000;
+/** 消息发送超时时间（毫秒），与 {@link WECOM_HTTP_TIMEOUT_MS} 一致 */
+const REPLY_SEND_TIMEOUT_MS = WECOM_HTTP_TIMEOUT_MS;
 /** WebSocket 心跳间隔（毫秒） */
 const WS_HEARTBEAT_INTERVAL_MS = 30000;
 /** WebSocket 连接断开时的最大重连次数 */
@@ -1004,20 +1008,82 @@ function createHttpCallbackReplyTransport() {
     };
 }
 /**
+ * 被动 HTTP 无法写回同一 TCP（已结束/写入失败）时，按 path/101138 用 response_url POST markdown，
+ * 或长连接 sendMessage(markdown) 主动推送。
+ */
+async function tryProactiveMarkdownFallback(params) {
+    const { frame, chatId, text, runtime, wsClient } = params;
+    const url = resolveResponseUrl(frame);
+    if (url) {
+        try {
+            await sendWeComMarkdownHttp({ responseUrl: url, text, runtime });
+            runtime.log?.(`[wecom] proactive markdown fallback ok (response_url)`);
+            return true;
+        }
+        catch (e) {
+            runtime.error?.(`[wecom] proactive markdown via response_url failed: ${String(e)}`);
+        }
+    }
+    if (wsClient?.isConnected) {
+        try {
+            await wsClient.sendMessage(chatId, {
+                msgtype: "markdown",
+                markdown: { content: text },
+            });
+            runtime.log?.(`[wecom] proactive markdown fallback ok (WS)`);
+            return true;
+        }
+        catch (e) {
+            runtime.error?.(`[wecom] proactive markdown via WS failed: ${String(e)}`);
+        }
+    }
+    return false;
+}
+/**
  * 无 response_url 时：按官方「加密与被动回复」在同一次 POST 响应中返回密文包（见 path/101033）。
  * 同一 TCP 响应只能写一次，因此仅处理 finish=true 的最终帧（中间 finish=false 由业务层跳过展示）。
  */
 function createPassiveHttpEncryptedReplyTransport(params) {
-    const { res, token, encodingAesKey, nonce } = params;
-    function sendEncryptedPlainJson(plainJson, runtime) {
+    const { res, token, encodingAesKey, nonce, proactiveFallback } = params;
+    async function sendEncryptedBodyOrFallback(plainJson, fallbackText, runtime, logOk) {
         if (res.writableEnded) {
-            runtime.log?.(`[wecom] passive http: response already ended, skip`);
+            runtime.log?.(`[wecom] passive http: response already ended, try proactive fallback`);
+            if (proactiveFallback) {
+                const ok = await tryProactiveMarkdownFallback({
+                    frame: proactiveFallback.frame,
+                    chatId: proactiveFallback.chatId,
+                    text: fallbackText,
+                    runtime,
+                    wsClient: proactiveFallback.wsClient,
+                });
+                if (!ok) {
+                    runtime.error?.(`[wecom] passive http: proactive fallback failed (no usable response_url or WS)`);
+                }
+            }
             return;
         }
-        const { body } = buildEncryptedJsonResponse(token, encodingAesKey, plainJson, nonce);
-        res.statusCode = 200;
-        res.setHeader("Content-Type", "application/json; charset=utf-8");
-        res.end(body);
+        try {
+            const { body } = buildEncryptedJsonResponse(token, encodingAesKey, plainJson, nonce);
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(body);
+            runtime.log?.(logOk);
+        }
+        catch (e) {
+            runtime.error?.(`[wecom] passive http: encrypted reply write failed: ${String(e)}`);
+            if (proactiveFallback) {
+                const ok = await tryProactiveMarkdownFallback({
+                    frame: proactiveFallback.frame,
+                    chatId: proactiveFallback.chatId,
+                    text: fallbackText,
+                    runtime,
+                    wsClient: proactiveFallback.wsClient,
+                });
+                if (!ok) {
+                    runtime.error?.(`[wecom] passive http: proactive fallback after write error also failed`);
+                }
+            }
+        }
     }
     return {
         replyStream: async ({ streamId, text, finish, runtime }) => {
@@ -1032,16 +1098,14 @@ function createPassiveHttpEncryptedReplyTransport(params) {
                     content: text,
                 },
             });
-            sendEncryptedPlainJson(plain, runtime);
-            runtime.log?.(`[wecom] passive http: sent encrypted stream reply (finish=true), len=${text.length}`);
+            await sendEncryptedBodyOrFallback(plain, text, runtime, `[wecom] passive http: sent encrypted stream reply (finish=true), len=${text.length}`);
         },
         sendMarkdownFallback: async ({ text, runtime }) => {
             const plain = JSON.stringify({
                 msgtype: "markdown",
                 markdown: { content: text },
             });
-            sendEncryptedPlainJson(plain, runtime);
-            runtime.log?.(`[wecom] passive http: sent encrypted markdown fallback, len=${text.length}`);
+            await sendEncryptedBodyOrFallback(plain, text, runtime, `[wecom] passive http: sent encrypted markdown fallback, len=${text.length}`);
         },
     };
 }
@@ -2154,10 +2218,27 @@ async function sendMediaBatch(ctx, mediaUrls) {
  *   改用 wsClient.sendMessage 主动发送完整文本。
  */
 async function finishThinkingStream(ctx) {
-    const { transport, frame, state, runtime } = ctx;
+    const { transport, frame, state, account, runtime } = ctx;
     const body = frame.body;
     const chatId = body.chatid || body.from.userid;
     let finishText = state.accumulatedText;
+    /** 非流式：仅发一条 Markdown，不走 replyStream（含 finish=true） */
+    if (account.streamReply === false) {
+        if (state.hasMedia) {
+            if (state.hasMediaFailed && state.mediaErrorSummary) {
+                finishText = finishText ? `${finishText}\n\n${state.mediaErrorSummary}` : state.mediaErrorSummary;
+            }
+            else if (!finishText) {
+                finishText = "📎 文件已发送，请查收。";
+            }
+        }
+        if (!finishText) {
+            finishText = "⚠️ 本次未生成可发送内容，请重试一次，或换一种问法。";
+        }
+        runtime.log?.(`[wecom] streamReply=false → single markdown send, len=${finishText.length}`);
+        await transport.sendMarkdownFallback({ frame, chatId, text: finishText, runtime });
+        return;
+    }
     if (state.hasMedia) {
         if (state.hasMediaFailed && state.mediaErrorSummary) {
             // 媒体成功发送：用友好提示告知用户
@@ -2221,6 +2302,7 @@ async function routeAndDispatchMessage(params) {
         }
     };
     let isShowThink = !(account.sendThinkingMessage ?? true);
+    const useStreamReply = account.streamReply !== false;
     try {
         runtime.log?.(`[wecom][trace] dispatch start: msgid=${frame.body.msgid}, chattype=${frame.body.chattype}, req_id=${frame.headers.req_id}`);
         await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -2243,6 +2325,9 @@ async function routeAndDispatchMessage(params) {
             dispatcherOptions: {
                 onReplyStart: async () => {
                     runtime.log?.(`[wecom][trace] onReplyStart: streamId=${state.streamId}, hasAccumulated=${Boolean(state.accumulatedText)}`);
+                    if (!useStreamReply) {
+                        return;
+                    }
                     if (!isShowThink && state.streamId && !state.accumulatedText) {
                         try {
                             await sendThinkingReply({ transport, frame, streamId: state.streamId, runtime, state });
@@ -2278,8 +2363,11 @@ async function routeAndDispatchMessage(params) {
                             runtime.error?.(`[wecom] sendMediaBatch threw: ${errMsg}`);
                         }
                     }
-                    // 中间帧：有可见文本时流式更新（流式过期后跳过，等 deliver 完成后主动发送）
-                    if (info.kind !== "final" && state.accumulatedText && !state.streamExpired) {
+                    // 中间帧：有可见文本时流式更新（非流式模式或非流式配置时跳过）
+                    if (useStreamReply &&
+                        info.kind !== "final" &&
+                        state.accumulatedText &&
+                        !state.streamExpired) {
                         try {
                             await transport.replyStream({
                                 frame,
@@ -2347,13 +2435,20 @@ async function processWeComMessage(params) {
     /** HTTP 入站（带 query nonce）或纯 HTTP 无 WS：为每条处理生成 invocation，避免 OpenClaw 入站去重误判 */
     const httpInvocationId = httpInvocationIdParam?.trim() ??
         (nonceForSid || !wsClient ? crypto.randomUUID() : undefined);
+    const body = frame.body;
+    const chatId = body.chatid || body.from.userid;
     const transport = wsClient
         ? createWebsocketReplyTransport(wsClient)
         : passiveHttpReply
-            ? createPassiveHttpEncryptedReplyTransport(passiveHttpReply)
+            ? createPassiveHttpEncryptedReplyTransport({
+                ...passiveHttpReply,
+                proactiveFallback: {
+                    frame,
+                    chatId,
+                    wsClient: wsClient ?? getWeComWebSocket(account.accountId),
+                },
+            })
             : createHttpCallbackReplyTransport();
-    const body = frame.body;
-    const chatId = body.chatid || body.from.userid;
     const chatType = body.chattype === "group" ? "group" : "direct";
     const messageId = body.msgid;
     const reqId = frame.headers.req_id;
@@ -2675,6 +2770,9 @@ const DefaultWsUrl = "wss://openws.work.weixin.qq.com";
 function resolveWeComAccount(cfg) {
     const wecomConfig = (cfg.channels?.[CHANNEL_ID] ?? {});
     const receiveMode = wecomConfig.receiveMode === "http" ? "http" : "websocket";
+    /** URL 回调默认非流式（单条 Markdown），长连接默认流式；可用 streamReply 显式覆盖 */
+    const streamReplyDefault = receiveMode !== "http";
+    const streamReply = wecomConfig.streamReply !== undefined ? wecomConfig.streamReply !== false : streamReplyDefault;
     return {
         accountId: DEFAULT_ACCOUNT_ID,
         name: wecomConfig.name ?? "联盟E动",
@@ -2687,6 +2785,7 @@ function resolveWeComAccount(cfg) {
         callbackToken: wecomConfig.callbackToken ?? "",
         encodingAesKey: wecomConfig.encodingAesKey ?? "",
         sendThinkingMessage: wecomConfig.sendThinkingMessage ?? true,
+        streamReply,
         config: wecomConfig,
     };
 }
@@ -2731,6 +2830,9 @@ function setWeComAccount(cfg, account) {
             : {}),
         ...(account.sendThinkingMessage !== undefined || existing?.sendThinkingMessage !== undefined
             ? { sendThinkingMessage: account.sendThinkingMessage ?? existing?.sendThinkingMessage }
+            : {}),
+        ...(account.streamReply !== undefined || existing?.streamReply !== undefined
+            ? { streamReply: account.streamReply ?? existing?.streamReply }
             : {}),
     };
     return {
@@ -2913,6 +3015,8 @@ async function handleIncomingCallback(params) {
         res.end();
         return;
     }
+    // 被动回复需在同 TCP 连接上返回密文；拉长 socket 超时，避免网关/Node 默认在 2min 内掐断
+    req.setTimeout(WECOM_HTTP_TIMEOUT_MS);
     let raw;
     try {
         raw = await readBody(req);

@@ -55,6 +55,7 @@ import { checkGroupPolicy } from "./group-policy.js";
 import { checkDmPolicy } from "./dm-policy.js";
 import {
   setWeComWebSocket,
+  getWeComWebSocket,
   setMessageState,
   deleteMessageState,
   setReqIdForChat,
@@ -386,6 +387,23 @@ async function finishThinkingStream(ctx: DeliverContext): Promise<void> {
   const chatId = body.chatid || body.from.userid;
   let finishText: string = state.accumulatedText;
 
+  /** 非流式：仅发一条 Markdown，不走 replyStream（含 finish=true） */
+  if (account.streamReply === false) {
+    if (state.hasMedia) {
+      if (state.hasMediaFailed && state.mediaErrorSummary) {
+        finishText = finishText ? `${finishText}\n\n${state.mediaErrorSummary}` : state.mediaErrorSummary;
+      } else if (!finishText) {
+        finishText = "📎 文件已发送，请查收。";
+      }
+    }
+    if (!finishText) {
+      finishText = "⚠️ 本次未生成可发送内容，请重试一次，或换一种问法。";
+    }
+    runtime.log?.(`[wecom] streamReply=false → single markdown send, len=${finishText.length}`);
+    await transport.sendMarkdownFallback({ frame, chatId, text: finishText, runtime });
+    return;
+  }
+
   if (state.hasMedia) {
     if (state.hasMediaFailed && state.mediaErrorSummary) {
       // 媒体成功发送：用友好提示告知用户
@@ -458,6 +476,7 @@ async function routeAndDispatchMessage(params: {
   };
 
   let isShowThink = !(account.sendThinkingMessage ?? true);
+  const useStreamReply = account.streamReply !== false;
 
   try {
     runtime.log?.(
@@ -485,6 +504,9 @@ async function routeAndDispatchMessage(params: {
           runtime.log?.(
             `[wecom][trace] onReplyStart: streamId=${state.streamId}, hasAccumulated=${Boolean(state.accumulatedText)}`,
           );
+          if (!useStreamReply) {
+            return;
+          }
           if (!isShowThink && state.streamId && !state.accumulatedText) {
             try {
               await sendThinkingReply({ transport, frame, streamId: state.streamId!, runtime, state })
@@ -523,8 +545,13 @@ async function routeAndDispatchMessage(params: {
             }
           }
 
-          // 中间帧：有可见文本时流式更新（流式过期后跳过，等 deliver 完成后主动发送）
-          if (info.kind !== "final" && state.accumulatedText && !state.streamExpired) {
+          // 中间帧：有可见文本时流式更新（非流式模式或非流式配置时跳过）
+          if (
+            useStreamReply &&
+            info.kind !== "final" &&
+            state.accumulatedText &&
+            !state.streamExpired
+          ) {
             try {
               await transport.replyStream({
                 frame,
@@ -617,13 +644,20 @@ export async function processWeComMessage(params: {
   const httpInvocationId =
     httpInvocationIdParam?.trim() ??
     (nonceForSid || !wsClient ? randomUUID() : undefined);
+  const body = frame.body as MessageBody;
+  const chatId = body.chatid || body.from.userid;
   const transport = wsClient
     ? createWebsocketReplyTransport(wsClient)
     : passiveHttpReply
-      ? createPassiveHttpEncryptedReplyTransport(passiveHttpReply)
+      ? createPassiveHttpEncryptedReplyTransport({
+          ...passiveHttpReply,
+          proactiveFallback: {
+            frame,
+            chatId,
+            wsClient: wsClient ?? getWeComWebSocket(account.accountId),
+          },
+        })
       : createHttpCallbackReplyTransport();
-  const body = frame.body as MessageBody;
-  const chatId = body.chatid || body.from.userid;
   const chatType = body.chattype === "group" ? "group" : "direct";
   const messageId = body.msgid;
   const reqId = frame.headers.req_id;

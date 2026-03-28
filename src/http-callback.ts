@@ -15,7 +15,7 @@ import {
 import { getWeComRuntime } from "./runtime.js";
 import { processWeComMessage } from "./monitor.js";
 import { resolveWeComAccount, type ResolvedWeComAccount } from "./utils.js";
-import { CHANNEL_ID } from "./const.js";
+import { CHANNEL_ID, WECOM_HTTP_TIMEOUT_MS } from "./const.js";
 import { wrapRuntimeEnvWithDebug } from "./debug-log.js";
 import { resolveResponseUrl } from "./wecom-transport.js";
 import { getWeComWebSocket } from "./state-manager.js";
@@ -166,6 +166,9 @@ async function handleIncomingCallback(params: {
     res.end();
     return;
   }
+
+  // 被动回复需在同 TCP 连接上返回密文；拉长 socket 超时，避免网关/Node 默认在 2min 内掐断
+  req.setTimeout(WECOM_HTTP_TIMEOUT_MS);
 
   let raw: string;
   try {

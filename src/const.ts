@@ -31,11 +31,16 @@ export const IMAGE_DOWNLOAD_TIMEOUT_MS = 30_000;
 /** 文件下载超时时间（毫秒） */
 export const FILE_DOWNLOAD_TIMEOUT_MS = 60_000;
 
-/** 消息发送超时时间（毫秒） */
-export const REPLY_SEND_TIMEOUT_MS = 15_000;
+/**
+ * 企微 HTTP：入站「接收消息 URL」长连接 + 主动回复 POST response_url 共用超时（毫秒）
+ */
+export const WECOM_HTTP_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** 消息发送超时时间（毫秒），与 {@link WECOM_HTTP_TIMEOUT_MS} 一致 */
+export const REPLY_SEND_TIMEOUT_MS = WECOM_HTTP_TIMEOUT_MS;
 
 /** 消息处理总超时时间（毫秒） */
-export const MESSAGE_PROCESS_TIMEOUT_MS = 5 * 60 * 1000;
+export const MESSAGE_PROCESS_TIMEOUT_MS = WECOM_HTTP_TIMEOUT_MS;
 
 /** WebSocket 心跳间隔（毫秒） */
 export const WS_HEARTBEAT_INTERVAL_MS = 30_000;

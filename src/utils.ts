@@ -51,6 +51,12 @@ export interface WeComConfig {
   groups?: Record<string, WeComGroupConfig>;
   /** 是否发送"思考中"消息，默认为 true */
   sendThinkingMessage?: boolean;
+  /**
+   * 是否使用流式回复（多段 finish=false + 最终 finish=true）。
+   * 设为 false 时仅最终一条 Markdown/文本（无流式打字效果），适合 HTTP 被动或希望减少连接占用。
+   * 默认 true（保持与历史行为一致）。
+   */
+  streamReply?: boolean;
   /** 额外允许访问的本地媒体路径白名单（支持 ~ 表示 home 目录），如 ["~/Downloads", "~/Documents"] */
   mediaLocalRoots?: string[];
 }
@@ -71,6 +77,8 @@ export interface ResolvedWeComAccount {
   encodingAesKey: string;
   /** 是否发送"思考中"消息，默认为 true */
   sendThinkingMessage: boolean;
+  /** 是否流式输出；false 时仅最终一条非流式消息 */
+  streamReply: boolean;
   config: WeComConfig;
 }
 
@@ -80,6 +88,10 @@ export interface ResolvedWeComAccount {
 export function resolveWeComAccount(cfg: OpenClawConfig): ResolvedWeComAccount {
   const wecomConfig = (cfg.channels?.[CHANNEL_ID] ?? {}) as WeComConfig;
   const receiveMode = wecomConfig.receiveMode === "http" ? "http" : "websocket";
+  /** URL 回调默认非流式（单条 Markdown），长连接默认流式；可用 streamReply 显式覆盖 */
+  const streamReplyDefault = receiveMode !== "http";
+  const streamReply =
+    wecomConfig.streamReply !== undefined ? wecomConfig.streamReply !== false : streamReplyDefault;
 
   return {
     accountId: DEFAULT_ACCOUNT_ID,
@@ -93,6 +105,7 @@ export function resolveWeComAccount(cfg: OpenClawConfig): ResolvedWeComAccount {
     callbackToken: wecomConfig.callbackToken ?? "",
     encodingAesKey: wecomConfig.encodingAesKey ?? "",
     sendThinkingMessage: wecomConfig.sendThinkingMessage ?? true,
+    streamReply,
     config: wecomConfig,
   };
 }
@@ -144,6 +157,9 @@ export function setWeComAccount(
       : {}),
     ...(account.sendThinkingMessage !== undefined || existing?.sendThinkingMessage !== undefined
       ? { sendThinkingMessage: account.sendThinkingMessage ?? existing?.sendThinkingMessage }
+      : {}),
+    ...(account.streamReply !== undefined || existing?.streamReply !== undefined
+      ? { streamReply: account.streamReply ?? existing?.streamReply }
       : {}),
   };
 
