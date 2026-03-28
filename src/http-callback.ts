@@ -294,7 +294,7 @@ async function handleIncomingCallback(params: {
     }
 
     runtimeEnv.log(
-      `[wecom] http: no response_url and WS offline → passive encrypted body in same HTTP response (doc 101033); configure websocketUrl/secret + channel running for hybrid`,
+      `[wecom] http: no active reply URL (101138) and WS offline → passive encrypted body in same HTTP response (doc 101033); ensure callback includes response_url or response_code, or configure websocketUrl/secret for hybrid`,
     );
     try {
       await processWeComMessage({
@@ -320,6 +320,9 @@ async function handleIncomingCallback(params: {
     return;
   }
 
+  runtimeEnv.log(
+    `[wecom] http: active reply URL resolved (doc 101138 https://developer.work.weixin.qq.com/document/path/101138); ack empty encrypted, then async POST to response_url`,
+  );
   sendEncryptedOk(res, token, encodingAesKey, nonce);
 
   void processWeComMessage({

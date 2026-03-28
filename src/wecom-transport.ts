@@ -30,10 +30,83 @@ function pickString(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() ? v.trim() : undefined;
 }
 
+/** 与官方「主动回复」文档一致：https://developer.work.weixin.qq.com/document/path/101138 */
+const QYAPI_AIBOT_RESPONSE_PATH = "cgi-bin/aibot/response";
+
+function buildActiveReplyUrlFromResponseCode(code: string): string {
+  const c = code.trim();
+  return `https://qyapi.weixin.qq.com/${QYAPI_AIBOT_RESPONSE_PATH}?response_code=${encodeURIComponent(c)}`;
+}
+
+/**
+ * 部分回调只下发 response_code，需拼成完整 URL 后才能 POST（见 path/101138）。
+ */
+function pickResponseCode(body: Record<string, unknown>, root: Record<string, unknown>): string | undefined {
+  return (
+    pickString(body.response_code) ??
+    pickString(body.responseCode) ??
+    pickString(root.response_code) ??
+    pickString(root.responseCode) ??
+    pickString((body.data as Record<string, unknown> | undefined)?.response_code) ??
+    pickString((body.data as Record<string, unknown> | undefined)?.responseCode) ??
+    pickString((body.message as Record<string, unknown> | undefined)?.response_code) ??
+    pickString((body.message as Record<string, unknown> | undefined)?.responseCode)
+  );
+}
+
+/**
+ * 深度扫描：兼容嵌套字段、或仅出现完整 https 主动回复地址的字符串（不同接入版本字段名不一致）。
+ */
+function deepFindResponseUrlString(obj: unknown, depth: number): string | undefined {
+  if (depth > 12 || obj == null) return undefined;
+  if (typeof obj === "string") {
+    const s = obj.trim();
+    if (
+      s.startsWith("http") &&
+      s.includes("qyapi.weixin.qq.com") &&
+      (s.includes("aibot") || s.includes(QYAPI_AIBOT_RESPONSE_PATH))
+    ) {
+      return s;
+    }
+    return undefined;
+  }
+  if (typeof obj !== "object") return undefined;
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const f = deepFindResponseUrlString(item, depth + 1);
+      if (f) return f;
+    }
+    return undefined;
+  }
+  const o = obj as Record<string, unknown>;
+  for (const [k, v] of Object.entries(o)) {
+    const kl = k.toLowerCase();
+    if (
+      (kl.includes("response_url") ||
+        kl === "responseurl" ||
+        kl.includes("reply_url") ||
+        kl.includes("aibot_response")) &&
+      typeof v === "string" &&
+      v.trim()
+    ) {
+      return v.trim();
+    }
+  }
+  for (const v of Object.values(o)) {
+    const f = deepFindResponseUrlString(v, depth + 1);
+    if (f) return f;
+  }
+  return undefined;
+}
+
+/**
+ * 从回调帧中解析主动回复地址（path/101138）。
+ * 优先显式字段，其次 response_code 拼接，最后深度扫描。
+ */
 export function resolveResponseUrl(frame: WsFrame): string | undefined {
   const body = (frame.body ?? {}) as Record<string, unknown>;
   const root = frame as unknown as Record<string, unknown>;
-  return (
+  const explicit =
     pickString(body.response_url) ??
     pickString(body.responseUrl) ??
     pickString(root.response_url) ??
@@ -41,8 +114,15 @@ export function resolveResponseUrl(frame: WsFrame): string | undefined {
     pickString((body.data as Record<string, unknown> | undefined)?.response_url) ??
     pickString((body.data as Record<string, unknown> | undefined)?.responseUrl) ??
     pickString((body.message as Record<string, unknown> | undefined)?.response_url) ??
-    pickString((body.message as Record<string, unknown> | undefined)?.responseUrl)
-  );
+    pickString((body.message as Record<string, unknown> | undefined)?.responseUrl);
+  if (explicit) {
+    return explicit;
+  }
+  const code = pickResponseCode(body, root);
+  if (code) {
+    return buildActiveReplyUrlFromResponseCode(code);
+  }
+  return deepFindResponseUrlString(frame, 0) ?? deepFindResponseUrlString(body, 0);
 }
 
 function throwMissingResponseUrl(frame: WsFrame): never {

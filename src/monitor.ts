@@ -246,13 +246,7 @@ function buildMessageContext(
 
     CommandAuthorized: true,
 
-    ResponseUrl:
-      body.response_url ||
-      (body as unknown as { responseUrl?: string }).responseUrl ||
-      (body as unknown as { data?: { response_url?: string; responseUrl?: string } }).data?.response_url ||
-      (body as unknown as { data?: { response_url?: string; responseUrl?: string } }).data?.responseUrl ||
-      (body as unknown as { message?: { response_url?: string; responseUrl?: string } }).message?.response_url ||
-      (body as unknown as { message?: { response_url?: string; responseUrl?: string } }).message?.responseUrl,
+    ResponseUrl: resolveResponseUrl(frame),
     ReqId: frame.headers.req_id,
     WeComFrame: frame,
 

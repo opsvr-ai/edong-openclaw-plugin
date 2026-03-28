@@ -850,17 +850,92 @@ function buildEncryptedJsonResponse(token, encodingAesKey, plainJson, nonce) {
 function pickString(v) {
     return typeof v === "string" && v.trim() ? v.trim() : undefined;
 }
+/** 与官方「主动回复」文档一致：https://developer.work.weixin.qq.com/document/path/101138 */
+const QYAPI_AIBOT_RESPONSE_PATH = "cgi-bin/aibot/response";
+function buildActiveReplyUrlFromResponseCode(code) {
+    const c = code.trim();
+    return `https://qyapi.weixin.qq.com/${QYAPI_AIBOT_RESPONSE_PATH}?response_code=${encodeURIComponent(c)}`;
+}
+/**
+ * 部分回调只下发 response_code，需拼成完整 URL 后才能 POST（见 path/101138）。
+ */
+function pickResponseCode(body, root) {
+    return (pickString(body.response_code) ??
+        pickString(body.responseCode) ??
+        pickString(root.response_code) ??
+        pickString(root.responseCode) ??
+        pickString(body.data?.response_code) ??
+        pickString(body.data?.responseCode) ??
+        pickString(body.message?.response_code) ??
+        pickString(body.message?.responseCode));
+}
+/**
+ * 深度扫描：兼容嵌套字段、或仅出现完整 https 主动回复地址的字符串（不同接入版本字段名不一致）。
+ */
+function deepFindResponseUrlString(obj, depth) {
+    if (depth > 12 || obj == null)
+        return undefined;
+    if (typeof obj === "string") {
+        const s = obj.trim();
+        if (s.startsWith("http") &&
+            s.includes("qyapi.weixin.qq.com") &&
+            (s.includes("aibot") || s.includes(QYAPI_AIBOT_RESPONSE_PATH))) {
+            return s;
+        }
+        return undefined;
+    }
+    if (typeof obj !== "object")
+        return undefined;
+    if (Array.isArray(obj)) {
+        for (const item of obj) {
+            const f = deepFindResponseUrlString(item, depth + 1);
+            if (f)
+                return f;
+        }
+        return undefined;
+    }
+    const o = obj;
+    for (const [k, v] of Object.entries(o)) {
+        const kl = k.toLowerCase();
+        if ((kl.includes("response_url") ||
+            kl === "responseurl" ||
+            kl.includes("reply_url") ||
+            kl.includes("aibot_response")) &&
+            typeof v === "string" &&
+            v.trim()) {
+            return v.trim();
+        }
+    }
+    for (const v of Object.values(o)) {
+        const f = deepFindResponseUrlString(v, depth + 1);
+        if (f)
+            return f;
+    }
+    return undefined;
+}
+/**
+ * 从回调帧中解析主动回复地址（path/101138）。
+ * 优先显式字段，其次 response_code 拼接，最后深度扫描。
+ */
 function resolveResponseUrl(frame) {
     const body = (frame.body ?? {});
     const root = frame;
-    return (pickString(body.response_url) ??
+    const explicit = pickString(body.response_url) ??
         pickString(body.responseUrl) ??
         pickString(root.response_url) ??
         pickString(root.responseUrl) ??
         pickString(body.data?.response_url) ??
         pickString(body.data?.responseUrl) ??
         pickString(body.message?.response_url) ??
-        pickString(body.message?.responseUrl));
+        pickString(body.message?.responseUrl);
+    if (explicit) {
+        return explicit;
+    }
+    const code = pickResponseCode(body, root);
+    if (code) {
+        return buildActiveReplyUrlFromResponseCode(code);
+    }
+    return deepFindResponseUrlString(frame, 0) ?? deepFindResponseUrlString(body, 0);
 }
 function throwMissingResponseUrl(frame) {
     const body = (frame.body ?? {});
@@ -1948,12 +2023,7 @@ function buildMessageContext(frame, account, config, text, mediaList, quoteConte
         OriginatingChannel: CHANNEL_ID,
         OriginatingTo: `${CHANNEL_ID}:${chatId}`,
         CommandAuthorized: true,
-        ResponseUrl: body.response_url ||
-            body.responseUrl ||
-            body.data?.response_url ||
-            body.data?.responseUrl ||
-            body.message?.response_url ||
-            body.message?.responseUrl,
+        ResponseUrl: resolveResponseUrl(frame),
         ReqId: frame.headers.req_id,
         WeComFrame: frame,
         MediaPath: mediaList[0]?.path,
@@ -2918,7 +2988,7 @@ async function handleIncomingCallback(params) {
                 .finally(releaseMsgidLock);
             return;
         }
-        runtimeEnv.log(`[wecom] http: no response_url and WS offline → passive encrypted body in same HTTP response (doc 101033); configure websocketUrl/secret + channel running for hybrid`);
+        runtimeEnv.log(`[wecom] http: no active reply URL (101138) and WS offline → passive encrypted body in same HTTP response (doc 101033); ensure callback includes response_url or response_code, or configure websocketUrl/secret for hybrid`);
         try {
             await processWeComMessage({
                 frame,
@@ -2944,6 +3014,7 @@ async function handleIncomingCallback(params) {
         }
         return;
     }
+    runtimeEnv.log(`[wecom] http: active reply URL resolved (doc 101138 https://developer.work.weixin.qq.com/document/path/101138); ack empty encrypted, then async POST to response_url`);
     sendEncryptedOk(res, token, encodingAesKey, nonce);
     void processWeComMessage({
         frame,

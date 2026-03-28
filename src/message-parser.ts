@@ -17,6 +17,8 @@ export interface MessageBody {
     userid: string;
   };
   response_url?: string;
+  /** 部分回调仅下发 code，需拼成主动回复 URL（path/101138） */
+  response_code?: string;
   msgtype: string;
   text?: {
     content: string;

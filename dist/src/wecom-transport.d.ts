@@ -20,6 +20,10 @@ export type WecomReplyTransport = {
         runtime: RuntimeEnv;
     }) => Promise<void>;
 };
+/**
+ * 从回调帧中解析主动回复地址（path/101138）。
+ * 优先显式字段，其次 response_code 拼接，最后深度扫描。
+ */
 export declare function resolveResponseUrl(frame: WsFrame): string | undefined;
 export declare function createWebsocketReplyTransport(wsClient: WSClient): WecomReplyTransport;
 export declare function createHttpCallbackReplyTransport(): WecomReplyTransport;
