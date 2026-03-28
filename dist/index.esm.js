@@ -2245,9 +2245,11 @@ async function routeAndDispatchMessage(params) {
  * 整体带超时保护，防止单条消息处理阻塞过久
  */
 async function processWeComMessage(params) {
-    const { frame, account, config, runtime, wsClient, passiveHttpReply, httpCallbackQueryNonce } = params;
-    /** 仅 HTTP 回调：每条处理独立 id，避免 OpenClaw 入站去重在长耗时/失败后把重试误判为重复 */
-    const httpInvocationId = wsClient ? undefined : randomUUID();
+    const { frame, account, config, runtime, wsClient, passiveHttpReply, httpCallbackQueryNonce, httpInvocationId: httpInvocationIdParam } = params;
+    const nonceForSid = (httpCallbackQueryNonce ?? passiveHttpReply?.nonce)?.trim();
+    /** HTTP 入站（带 query nonce）或纯 HTTP 无 WS：为每条处理生成 invocation，避免 OpenClaw 入站去重误判 */
+    const httpInvocationId = httpInvocationIdParam?.trim() ??
+        (nonceForSid || !wsClient ? randomUUID() : undefined);
     const transport = wsClient
         ? createWebsocketReplyTransport(wsClient)
         : passiveHttpReply
@@ -2344,9 +2346,7 @@ async function processWeComMessage(params) {
     // }
     // Step 7: 构建上下文并路由到核心处理流程（带整体超时保护）
     const ctxPayload = buildMessageContext(frame, account, config, text, mediaList, quoteContent, {
-        httpCallbackQueryNonce: wsClient
-            ? undefined
-            : (httpCallbackQueryNonce ?? passiveHttpReply?.nonce),
+        httpCallbackQueryNonce: nonceForSid,
         httpInvocationId,
     });
     // runtime.log?.(`[plugin -> openclaw] body=${text}, mediaPaths=${JSON.stringify(mediaList.map(m => m.path))}${quoteContent ? `, quote=${quoteContent}` : ''}`);
@@ -2695,6 +2695,13 @@ function wrapRuntimeEnvWithDebug(runtime, source) {
  * 企业微信智能机器人「接收消息 URL」HTTP 回调（GET 验证 + POST 收消息）
  */
 const DEFAULT_CALLBACK_PATH = "/channels/wecom/callback";
+/**
+ * 无 response_url 时：同一条用户消息在长耗时下可能被企微重试，产生第二条 POST（新 TCP、新 res）。
+ * 若并行跑两次 processWeComMessage，后到的请求可能被 OpenClaw 入站去重跳过，却先结束 HTTP 并写入兜底短文案；
+ * 先到的连接稍后写完完整密文，客户端表现混乱或像「第二次无响应」。
+ * 对同一 msgid 串行：仅第一条进入 agent，重复 POST 只 ack 空包。
+ */
+const passiveHttpInFlightMsgids = new Set();
 function resolvePluginRuntimeEnv() {
     const pr = getWeComRuntime();
     const child = pr.logging.getChildLogger({ plugin: "wecom-http" });
@@ -2879,7 +2886,39 @@ async function handleIncomingCallback(params) {
     }
     const responseUrl = resolveResponseUrl(frame);
     if (!responseUrl) {
-        runtimeEnv.log(`[wecom] http: callback has no response_url; will await agent reply and send passive encrypted HTTP body (doc 101033)`);
+        const msgid = frame.body?.msgid?.trim();
+        if (msgid && passiveHttpInFlightMsgids.has(msgid)) {
+            runtimeEnv.log(`[wecom] http: passive duplicate POST while first still in-flight (msgid=${msgid}), ack empty encrypted only`);
+            sendEncryptedOk(res, token, encodingAesKey, nonce);
+            return;
+        }
+        if (msgid) {
+            passiveHttpInFlightMsgids.add(msgid);
+        }
+        const releaseMsgidLock = () => {
+            if (msgid) {
+                passiveHttpInFlightMsgids.delete(msgid);
+            }
+        };
+        const ws = getWeComWebSocket(account.accountId);
+        if (ws?.isConnected) {
+            runtimeEnv.log(`[wecom] http: no response_url but WS connected → ack empty encrypted, then async proactive reply via stream (hybrid)`);
+            sendEncryptedOk(res, token, encodingAesKey, nonce);
+            void processWeComMessage({
+                frame,
+                account,
+                config: cfg,
+                runtime: runtimeEnv,
+                wsClient: ws,
+                httpCallbackQueryNonce: nonce,
+            })
+                .catch((err) => {
+                runtimeEnv.error(`[wecom] http callback process failed: ${String(err)}`);
+            })
+                .finally(releaseMsgidLock);
+            return;
+        }
+        runtimeEnv.log(`[wecom] http: no response_url and WS offline → passive encrypted body in same HTTP response (doc 101033); configure websocketUrl/secret + channel running for hybrid`);
         try {
             await processWeComMessage({
                 frame,
@@ -2888,6 +2927,7 @@ async function handleIncomingCallback(params) {
                 runtime: runtimeEnv,
                 wsClient: null,
                 passiveHttpReply: { res, token, encodingAesKey, nonce },
+                httpCallbackQueryNonce: nonce,
             });
             if (!res.writableEnded) {
                 sendEncryptedOk(res, token, encodingAesKey, nonce);
@@ -2898,6 +2938,9 @@ async function handleIncomingCallback(params) {
             if (!res.writableEnded) {
                 sendEncryptedOk(res, token, encodingAesKey, nonce);
             }
+        }
+        finally {
+            releaseMsgidLock();
         }
         return;
     }

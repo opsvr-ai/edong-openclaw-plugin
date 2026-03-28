@@ -18,8 +18,17 @@ import { resolveWeComAccount, type ResolvedWeComAccount } from "./utils.js";
 import { CHANNEL_ID } from "./const.js";
 import { wrapRuntimeEnvWithDebug } from "./debug-log.js";
 import { resolveResponseUrl } from "./wecom-transport.js";
+import { getWeComWebSocket } from "./state-manager.js";
 
 const DEFAULT_CALLBACK_PATH = "/channels/wecom/callback";
+
+/**
+ * 无 response_url 时：同一条用户消息在长耗时下可能被企微重试，产生第二条 POST（新 TCP、新 res）。
+ * 若并行跑两次 processWeComMessage，后到的请求可能被 OpenClaw 入站去重跳过，却先结束 HTTP 并写入兜底短文案；
+ * 先到的连接稍后写完完整密文，客户端表现混乱或像「第二次无响应」。
+ * 对同一 msgid 串行：仅第一条进入 agent，重复 POST 只 ack 空包。
+ */
+const passiveHttpInFlightMsgids = new Set<string>();
 
 function resolvePluginRuntimeEnv(): RuntimeEnv {
   const pr = getWeComRuntime();
@@ -245,8 +254,47 @@ async function handleIncomingCallback(params: {
 
   const responseUrl = resolveResponseUrl(frame);
   if (!responseUrl) {
+    const msgid = (frame.body as { msgid?: string } | undefined)?.msgid?.trim();
+    if (msgid && passiveHttpInFlightMsgids.has(msgid)) {
+      runtimeEnv.log(
+        `[wecom] http: passive duplicate POST while first still in-flight (msgid=${msgid}), ack empty encrypted only`,
+      );
+      sendEncryptedOk(res, token, encodingAesKey, nonce);
+      return;
+    }
+    if (msgid) {
+      passiveHttpInFlightMsgids.add(msgid);
+    }
+
+    const releaseMsgidLock = () => {
+      if (msgid) {
+        passiveHttpInFlightMsgids.delete(msgid);
+      }
+    };
+
+    const ws = getWeComWebSocket(account.accountId);
+    if (ws?.isConnected) {
+      runtimeEnv.log(
+        `[wecom] http: no response_url but WS connected → ack empty encrypted, then async proactive reply via stream (hybrid)`,
+      );
+      sendEncryptedOk(res, token, encodingAesKey, nonce);
+      void processWeComMessage({
+        frame,
+        account,
+        config: cfg,
+        runtime: runtimeEnv,
+        wsClient: ws,
+        httpCallbackQueryNonce: nonce,
+      })
+        .catch((err) => {
+          runtimeEnv.error(`[wecom] http callback process failed: ${String(err)}`);
+        })
+        .finally(releaseMsgidLock);
+      return;
+    }
+
     runtimeEnv.log(
-      `[wecom] http: callback has no response_url; will await agent reply and send passive encrypted HTTP body (doc 101033)`,
+      `[wecom] http: no response_url and WS offline → passive encrypted body in same HTTP response (doc 101033); configure websocketUrl/secret + channel running for hybrid`,
     );
     try {
       await processWeComMessage({
@@ -256,6 +304,7 @@ async function handleIncomingCallback(params: {
         runtime: runtimeEnv,
         wsClient: null,
         passiveHttpReply: { res, token, encodingAesKey, nonce },
+        httpCallbackQueryNonce: nonce,
       });
       if (!res.writableEnded) {
         sendEncryptedOk(res, token, encodingAesKey, nonce);
@@ -265,6 +314,8 @@ async function handleIncomingCallback(params: {
       if (!res.writableEnded) {
         sendEncryptedOk(res, token, encodingAesKey, nonce);
       }
+    } finally {
+      releaseMsgidLock();
     }
     return;
   }

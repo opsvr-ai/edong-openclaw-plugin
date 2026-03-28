@@ -603,7 +603,8 @@ export async function processWeComMessage(params: {
   /** URL 回调模式下为 null */
   wsClient: WSClient | null;
   /**
-   * 无 response_url 时：在同一次企微 POST 回调的 HTTP 响应中返回加密被动回复（path/101033），不能与先发空包再异步回复混用。
+   * 无 response_url 时：在同一次企微 POST 回调的 HTTP 响应中返回加密被动回复（path/101033）。
+   * 若同时已建立长连接，http-callback 会先空包应答，再传入 wsClient 走本分支，用流式主动发回复（与「先空包 + 异步」一致）。
    */
   passiveHttpReply?: {
     res: ServerResponse;
@@ -611,12 +612,17 @@ export async function processWeComMessage(params: {
     encodingAesKey: string;
     nonce: string;
   };
-  /** URL 回调 query 中的 nonce，用于 MessageSid 去重键（与 msgid 组合）；长连接模式勿传 */
+  /** URL 回调 query 中的 nonce，用于 MessageSid 去重键（与 msgid 组合）；纯长连接入站勿传 */
   httpCallbackQueryNonce?: string;
+  /** 显式指定 HTTP 入站 invocation id（一般无需传，由内部 randomUUID） */
+  httpInvocationId?: string;
 }): Promise<void> {
-  const { frame, account, config, runtime, wsClient, passiveHttpReply, httpCallbackQueryNonce } = params;
-  /** 仅 HTTP 回调：每条处理独立 id，避免 OpenClaw 入站去重在长耗时/失败后把重试误判为重复 */
-  const httpInvocationId = wsClient ? undefined : randomUUID();
+  const { frame, account, config, runtime, wsClient, passiveHttpReply, httpCallbackQueryNonce, httpInvocationId: httpInvocationIdParam } = params;
+  const nonceForSid = (httpCallbackQueryNonce ?? passiveHttpReply?.nonce)?.trim();
+  /** HTTP 入站（带 query nonce）或纯 HTTP 无 WS：为每条处理生成 invocation，避免 OpenClaw 入站去重误判 */
+  const httpInvocationId =
+    httpInvocationIdParam?.trim() ??
+    (nonceForSid || !wsClient ? randomUUID() : undefined);
   const transport = wsClient
     ? createWebsocketReplyTransport(wsClient)
     : passiveHttpReply
@@ -730,9 +736,7 @@ export async function processWeComMessage(params: {
 
   // Step 7: 构建上下文并路由到核心处理流程（带整体超时保护）
   const ctxPayload = buildMessageContext(frame, account, config, text, mediaList, quoteContent, {
-    httpCallbackQueryNonce: wsClient
-      ? undefined
-      : (httpCallbackQueryNonce ?? passiveHttpReply?.nonce),
+    httpCallbackQueryNonce: nonceForSid,
     httpInvocationId,
   });
   // runtime.log?.(`[plugin -> openclaw] body=${text}, mediaPaths=${JSON.stringify(mediaList.map(m => m.path))}${quoteContent ? `, quote=${quoteContent}` : ''}`);
