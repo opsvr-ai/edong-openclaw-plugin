@@ -90,7 +90,9 @@ function throwMissingResponseUrl(frame: WsFrame): never {
 export function createWebsocketReplyTransport(wsClient: WSClient): WecomReplyTransport {
   return {
     replyStream: async ({ frame, streamId, text, finish, runtime }) => {
+      runtime.log?.(`[transport][ws] replyStream - streamId=${streamId}, finish=${finish}, textLen=${text.length}, text="${text.substring(0, 100)}..."`);
       await sendWeComReply({ wsClient, frame, text, runtime, finish, streamId });
+      runtime.log?.(`[transport][ws] replyStream sent successfully`);
     },
     sendMarkdownFallback: async ({ chatId, text, runtime }) => {
       await wsClient.sendMessage(chatId, {
@@ -106,10 +108,12 @@ export function createHttpCallbackReplyTransport(): WecomReplyTransport {
   return {
     replyStream: async ({ frame, streamId, text, finish, runtime }) => {
       const responseUrl = resolveResponseUrl(frame);
+      runtime.log?.(`[transport][http] replyStream - streamId=${streamId}, finish=${finish}, textLen=${text.length}, responseUrl=${responseUrl}, text="${text.substring(0, 100)}..."`);
       if (!responseUrl) {
         throwMissingResponseUrl(frame);
       }
       await sendWeComReplyHttp({ responseUrl, streamId, text, finish, runtime });
+      runtime.log?.(`[transport][http] replyStream sent successfully`);
     },
     sendMarkdownFallback: async ({ frame, text, runtime }) => {
       const responseUrl = resolveResponseUrl(frame);
@@ -153,7 +157,9 @@ export function createPassiveHttpEncryptedReplyTransport(params: {
 
   return {
     replyStream: async ({ streamId, text, finish, runtime }) => {
+      runtime.log?.(`[transport][passive] replyStream - streamId=${streamId}, finish=${finish}, textLen=${text.length}, text="${text.substring(0, 100)}..."`);
       if (!finish) {
+        runtime.log?.(`[transport][passive] Skipping intermediate frame (finish=false)`);
         return;
       }
       const plain = JSON.stringify({
@@ -165,7 +171,7 @@ export function createPassiveHttpEncryptedReplyTransport(params: {
         },
       });
       sendEncryptedPlainJson(plain, runtime);
-      runtime.log?.(`[wecom] passive http: sent encrypted stream reply (finish=true), len=${text.length}`);
+      runtime.log?.(`[wecom][passive] Sent encrypted stream reply (finish=true), len=${text.length}`);
     },
     sendMarkdownFallback: async ({ text, runtime }) => {
       const plain = JSON.stringify({

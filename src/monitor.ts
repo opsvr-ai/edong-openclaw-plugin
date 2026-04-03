@@ -394,30 +394,38 @@ async function finishThinkingStream(ctx: DeliverContext): Promise<void> {
   const chatId = body.chatid || body.from.userid;
   let finishText: string = state.accumulatedText;
 
+  runtime.log?.(`[wecom][finish] Starting - hasMedia=${state.hasMedia}, hasMediaFailed=${state.hasMediaFailed}, accumulatedTextLen=${finishText.length}, streamStarted=${state.streamStarted}, streamExpired=${state.streamExpired}`);
+
   if (state.hasMedia) {
     if (state.hasMediaFailed && state.mediaErrorSummary) {
       // 媒体成功发送：用友好提示告知用户
       finishText = finishText ? `${finishText}\n\n${state.mediaErrorSummary}` : state.mediaErrorSummary;
+      runtime.log?.(`[wecom][finish] Added media error summary`);
     } else if (!finishText) {
-      finishText = "File sent successfully.";
+      finishText = “File sent successfully.”;
+      runtime.log?.(`[wecom][finish] Using default file success message`);
     }
   }
 
   if (!finishText) {
     // 兜底：当 OpenClaw 未产生可投递块（例如被去重/工具流程未产出 final 文本）时，
     // 仍需关闭 thinking 并给用户可见反馈，避免表现为”机器人无响应”。
-    finishText = "No content generated. Please try again.";
+    finishText = “No content generated. Please try again.”;
+    runtime.log?.(`[wecom][finish] No content, using fallback message`);
   }
+
+  runtime.log?.(`[wecom][finish] Final text to send (length=${finishText.length}): “${finishText.substring(0, 200)}...”`);
 
   if (finishText) {
     if (!state.streamStarted) {
-      runtime.log?.(`[wecom] stream not started, sending final text via markdown fallback`);
+      runtime.log?.(`[wecom][finish] Stream not started, using markdown fallback`);
       await transport.sendMarkdownFallback({ frame, chatId, text: finishText, runtime });
       return;
     }
     // 尝试流式发送；若已知过期或发送时发现过期，统一降级为主动发送
     let expired = state.streamExpired;
     if (!expired) {
+      runtime.log?.(`[wecom][finish] Attempting to send via stream (finish=true)`);
       try {
         await transport.replyStream({
           frame,
@@ -426,7 +434,9 @@ async function finishThinkingStream(ctx: DeliverContext): Promise<void> {
           finish: true,
           runtime,
         });
+        runtime.log?.(`[wecom][finish] Stream finish sent successfully`);
       } catch (err) {
+        runtime.error?.(`[wecom][finish] Stream finish failed: ${String(err)}`);
         if (err instanceof StreamExpiredError) {
           expired = true;
         } else {
@@ -435,21 +445,26 @@ async function finishThinkingStream(ctx: DeliverContext): Promise<void> {
       }
     }
     if (expired) {
-      runtime.log?.(`[wecom] Stream expired, trying fallback methods`);
+      runtime.log?.(`[wecom][finish] Stream expired, trying fallback methods`);
       // 优先使用主动推送（URL回调模式且配置了corpId/corpSecret）
       if (transport.supportsProactive && transport.sendProactive) {
+        runtime.log?.(`[wecom][finish] Attempting proactive push`);
         try {
           await transport.sendProactive({ chatId, text: finishText, runtime });
-          runtime.log?.(`[wecom] Sent via proactive push API`);
+          runtime.log?.(`[wecom][finish] Proactive push sent successfully`);
           return;
         } catch (proactiveErr) {
-          runtime.error?.(`[wecom] Proactive push failed: ${String(proactiveErr)}, fallback to markdown`);
+          runtime.error?.(`[wecom][finish] Proactive push failed: ${String(proactiveErr)}, fallback to markdown`);
         }
+      } else {
+        runtime.log?.(`[wecom][finish] Proactive push not available (supportsProactive=${transport.supportsProactive})`);
       }
       // 降级为markdown
+      runtime.log?.(`[wecom][finish] Using markdown fallback`);
       await transport.sendMarkdownFallback({ frame, chatId, text: finishText, runtime });
     }
   }
+  runtime.log?.(`[wecom][finish] Completed`);
 }
 
 /**
@@ -476,27 +491,37 @@ async function routeAndDispatchMessage(params: {
     if (!cleanedUp) { cleanedUp = true; onCleanup(); }
   };
 
-  let isShowThink = !(account.sendThinkingMessage ?? true);
+  const shouldSendThinking = account.sendThinkingMessage ?? true;
 
   // 心跳定时器：保持连接活跃
   let heartbeatTimer: NodeJS.Timeout | null = null;
   let heartbeatDots = "";
   const stopHeartbeat = () => {
     if (heartbeatTimer) {
+      runtime.log?.(`[wecom][heartbeat] Stopping heartbeat timer`);
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
     }
   };
 
   try {
+    const body = frame.body as MessageBody;
     runtime.log?.(
-      `[wecom][trace] dispatch start: msgid=${(frame.body as MessageBody).msgid}, chattype=${(frame.body as MessageBody).chattype}, req_id=${frame.headers.req_id}`,
+      `[wecom][dispatch] START - msgid=${body.msgid}, chattype=${body.chattype}, req_id=${frame.headers.req_id}, userMessage="${ctxPayload.Body}", shouldSendThinking=${shouldSendThinking}, streamId=${state.streamId}`,
     );
 
     // 启动心跳：立即发送"AI思考中..."，然后每秒追加一个点
     const startHeartbeat = async () => {
-      if (!state.streamId || state.streamExpired) return;
+      if (!state.streamId) {
+        runtime.error?.(`[wecom][heartbeat] Cannot start - no streamId`);
+        return;
+      }
+      if (state.streamExpired) {
+        runtime.error?.(`[wecom][heartbeat] Cannot start - stream already expired`);
+        return;
+      }
 
+      runtime.log?.(`[wecom][heartbeat] Starting - sending initial thinking message: "${THINKING_MESSAGE}"`);
       try {
         await transport.replyStream({
           frame,
@@ -506,38 +531,48 @@ async function routeAndDispatchMessage(params: {
           runtime,
         });
         state.streamStarted = true;
+        runtime.log?.(`[wecom][heartbeat] Initial thinking message sent successfully`);
 
         heartbeatTimer = setInterval(async () => {
           if (state.streamExpired || state.accumulatedText) {
+            runtime.log?.(`[wecom][heartbeat] Auto-stopping - streamExpired=${state.streamExpired}, hasContent=${Boolean(state.accumulatedText)}`);
             stopHeartbeat();
             return;
           }
           heartbeatDots += ".";
+          const heartbeatText = THINKING_MESSAGE + heartbeatDots;
+          runtime.log?.(`[wecom][heartbeat] Sending update: "${heartbeatText}"`);
           try {
             await transport.replyStream({
               frame,
               streamId: state.streamId!,
-              text: THINKING_MESSAGE + heartbeatDots,
+              text: heartbeatText,
               finish: false,
               runtime,
             });
+            runtime.log?.(`[wecom][heartbeat] Update sent successfully`);
           } catch (err) {
+            runtime.error?.(`[wecom][heartbeat] Update failed: ${String(err)}`);
             if (err instanceof StreamExpiredError) {
               state.streamExpired = true;
               stopHeartbeat();
             }
           }
         }, 1000);
+        runtime.log?.(`[wecom][heartbeat] Timer started - will update every 1 second`);
       } catch (err) {
+        runtime.error?.(`[wecom][heartbeat] Failed to send initial message: ${String(err)}`);
         if (err instanceof StreamExpiredError) {
           state.streamExpired = true;
         }
       }
     };
 
-    if (!isShowThink) {
+    if (shouldSendThinking) {
+      runtime.log?.(`[wecom][heartbeat] Config enabled - starting heartbeat`);
       await startHeartbeat();
-      isShowThink = true;
+    } else {
+      runtime.log?.(`[wecom][heartbeat] Config disabled - skipping heartbeat`);
     }
 
     await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -574,12 +609,13 @@ async function routeAndDispatchMessage(params: {
         deliver: async (payload, info) => {
           state.deliverCalled = true;
           runtime.log?.(
-            `[wecom][trace] deliver: kind=${info.kind}, hasText=${Boolean(payload.text)}, mediaUrl=${payload.mediaUrl ?? ""}, mediaUrlsCount=${payload.mediaUrls?.length ?? 0}`,
+            `[wecom][deliver] kind=${info.kind}, hasText=${Boolean(payload.text)}, textLength=${payload.text?.length ?? 0}, text="${payload.text?.substring(0, 100)}...", mediaUrl=${payload.mediaUrl ?? ""}, mediaUrlsCount=${payload.mediaUrls?.length ?? 0}`,
           );
 
           // 累积文本
           if (payload.text) {
             state.accumulatedText += (payload.text || '');
+            runtime.log?.(`[wecom][deliver] Accumulated text length: ${state.accumulatedText.length}, stopping heartbeat`);
             // 有实际内容时停止心跳
             stopHeartbeat();
           }
@@ -604,6 +640,7 @@ async function routeAndDispatchMessage(params: {
 
           // 中间帧：有可见文本时流式更新（流式过期后跳过，等 deliver 完成后主动发送）
           if (info.kind !== "final" && state.accumulatedText && !state.streamExpired) {
+            runtime.log?.(`[wecom][deliver] Sending intermediate update, text length: ${state.accumulatedText.length}`);
             try {
               await transport.replyStream({
                 frame,
@@ -613,10 +650,12 @@ async function routeAndDispatchMessage(params: {
                 runtime,
               });
               state.streamStarted = true;
+              runtime.log?.(`[wecom][deliver] Intermediate update sent successfully`);
             } catch (err) {
+              runtime.error?.(`[wecom][deliver] Intermediate update failed: ${String(err)}`);
               if (err instanceof StreamExpiredError) {
                 state.streamExpired = true;
-                runtime.log?.(`[wecom] Stream expired during intermediate reply, will fallback to proactive send`);
+                runtime.log?.(`[wecom][deliver] Stream expired, will fallback to proactive send`);
               } else {
                 throw err;
               }
@@ -624,33 +663,36 @@ async function routeAndDispatchMessage(params: {
           }
         },
         onError: (err, info) => {
-          runtime.error?.(`[wecom] ${info.kind} reply failed: ${String(err)}`);
+          runtime.error?.(`[wecom][dispatch] ${info.kind} reply failed: ${String(err)}`);
         },
       },
     });
     runtime.log?.(
-      `[wecom][trace] dispatch done: deliverCalled=${Boolean(state.deliverCalled)}, accumulatedTextLen=${state.accumulatedText.length}`,
+      `[wecom][dispatch] DONE - deliverCalled=${Boolean(state.deliverCalled)}, accumulatedTextLen=${state.accumulatedText.length}, streamStarted=${state.streamStarted}, streamExpired=${state.streamExpired}`,
     );
 
     if (!state.deliverCalled) {
       runtime.error?.(
-        `[wecom][warn] dispatch finished but deliver never ran — OpenClaw deduped/skipped this inbound, or the agent produced no deliverable blocks (e.g. empty final after tools). msgid=${(frame.body as MessageBody).msgid}`,
+        `[wecom][dispatch] WARN - deliver never ran, OpenClaw may have deduped this message. msgid=${body.msgid}`,
       );
     }
 
     // 关闭 thinking 流
+    runtime.log?.(`[wecom][dispatch] Finishing thinking stream, stopping heartbeat first`);
     stopHeartbeat();
     await finishThinkingStream(ctx);
+    runtime.log?.(`[wecom][dispatch] Thinking stream finished, cleaning up`);
     safeCleanup();
   } catch (err) {
-    runtime.error?.(`[wecom][plugin] Failed to process message: ${String(err)}`);
+    runtime.error?.(`[wecom][dispatch] ERROR - Failed to process message: ${String(err)}`);
     // 即使 dispatch 抛异常，也需要关闭 thinking 流，
     // 避免 deliver 已成功发送媒体但后续出错时 thinking 消息残留或被错误文案覆盖
+    runtime.log?.(`[wecom][dispatch] Exception caught, stopping heartbeat and finishing stream`);
     stopHeartbeat();
     try {
       await finishThinkingStream(ctx);
     } catch (finishErr) {
-      runtime.error?.(`[wecom] Failed to finish thinking stream after dispatch error: ${String(finishErr)}`);
+      runtime.error?.(`[wecom][dispatch] Failed to finish thinking stream after error: ${String(finishErr)}`);
     }
     safeCleanup();
   }
