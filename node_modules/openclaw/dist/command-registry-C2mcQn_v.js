@@ -1,0 +1,13 @@
+import "./logger-kwZIqwuw.js";
+import "./paths-ViKUYWUK.js";
+import "./tmp-openclaw-dir-idKIOMmb.js";
+import "./theme-CdOoMzRk.js";
+import "./globals-DBUMOBZ8.js";
+import "./subsystem-DISldKSB.js";
+import "./ansi-BEJF8NKS.js";
+import "./boolean-C3GkJetE.js";
+import "./env-Dnra1IpT.js";
+import "./register.subclis-tBDRQthO.js";
+import "./core-command-descriptors-bZIVoqs9.js";
+import { n as registerCoreCliByName } from "./command-registry-ypfgxxJr.js";
+export { registerCoreCliByName };
